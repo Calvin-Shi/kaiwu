@@ -1,0 +1,81 @@
+title: "框架默认标题" # 【必填】全局配置，监控面板中文名称
+groups: # 【可选】面板组
+  - group_name: "基础指标"
+    group_name_en: "basic"
+    panels:
+      - panel_name: "训练累计步数"
+        panel_name_en: "train_global_step"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "train_global_step"
+            expr: "sum(kaiwu_train_global_step{})"
+
+      - panel_name: "预测累计次数"
+        panel_name_en: "predict_succ_cnt"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "predict_succ_cnt"
+            expr: "sum(max_over_time(kaiwu_actor_predict_succ_cnt{}[1h]))"
+
+      - panel_name: "样本生产消耗比"
+        panel_name_en: "sample_production_and_consumption_ratio"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "sample_production_and_consumption_ratio"
+            expr: "avg(kaiwu_sample_production_and_consumption_ratio{})"
+
+      - panel_name: "已结束任务数"
+        panel_name_en: "episode_cnt"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "episode_cnt"
+            expr: "sum(max_over_time(kaiwu_episode_cnt{}[1h]))"
+
+      - panel_name: "模型加载次数"
+        panel_name_en: "load_model_succ_cnt"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "load_model_succ_cnt"
+            expr: "sum(max_over_time(kaiwu_actor_load_last_model_succ_cnt{}[1h]))"
+
+      - panel_name: "样本接收次数"
+        panel_name_en: "sample_receive_cnt"
+        type: "line"
+        unit: ""
+        custom: ""
+        metrics:
+          - metrics_name: "sample_receive_cnt"
+            expr: "sum(kaiwu_sample_receive_cnt{})"
+
+  - group_name: "硬件指标"
+    group_name_en: "hardware"
+    panels:
+      - panel_name: "CPU使用率"
+        panel_name_en: "cpu_usage"
+        type: "line"
+        unit: "%"
+        custom: ""
+        metrics:
+          - metrics_name: "aisrv_cpu_usage"
+            expr: '(sum(rate(container_cpu_usage_seconds_total{pod=~"train-.*-aisrv-.*", container!=""}[$__rate_interval]))/sum(kube_pod_container_resource_limits{pod=~"train-.*-aisrv-.*", resource="cpu"})) or on() vector(0)'
+          - metrics_name: "learner_cpu_usage"
+            expr: '(sum(rate(container_cpu_usage_seconds_total{pod=~"train-.*-learner-.*", container!=""}[$__rate_interval]))/sum(kube_pod_container_resource_limits{pod=~"train-.*-learner-.*", resource="cpu"})) or on() vector(0)'
+
+      - panel_name: "内存使用率"
+        panel_name_en: "ram_usage"
+        type: "line"
+        unit: "%"
+        custom: ""
+        metrics:
+          - metrics_name: "ram_usage"
+            expr: 'sum(avg_over_time(container_memory_working_set_bytes{container!~".*pushgateway.*"}[$__rate_interval])) / sum(kube_pod_container_resource_limits{resource="memory", container!~".*pushgateway.*"})'

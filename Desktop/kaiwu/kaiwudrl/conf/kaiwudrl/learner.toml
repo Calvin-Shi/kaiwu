@@ -1,0 +1,59 @@
+[learner]
+# 加载业务的app配置
+app_configure_file = "conf/configure_app.toml"
+# 加载项目的默认配置
+project_default_file = "/root/tools/conf/project_default.toml"
+# 加载项目的默认可配置项
+project_configurable_check_file = "/root/tools/conf/project_configurable.toml"
+# 加载监控配置 V2
+project_monitor_default_file = "/root/tools/conf/monitor_default.yaml"
+monitor_default_file = "kaiwudrl/conf/kaiwudrl/monitor.yaml" 
+# 监控配置上传目录
+standard_monitor_upload_file_dir = "/workspace/train/"
+# v1 grafana面板 、v2 平台自定义面板
+monitor_version = "v1" 
+# learner上传COS文件的频率
+model_file_save_per_minutes = 1
+# 进程序号
+svr_index = 0
+# 进程端口
+svr_ports = 9099
+# 进程名字
+svr_name = "learner"
+# modelpool地址
+modelpool_remote_addrs = "127.0.0.1:10014"
+# IP
+ip_address = "0.0.0.0"
+# 七彩石组名
+rainbow_group = "learner"
+# reverb的相关配置
+reverb_num_workers_per_iterator = 4
+reverb_rate_limiter = "MinSize"
+reverb_samples_per_insert = 9999
+reverb_error_buffer = 1000
+reverb_data_cache = false
+reverb_num_samples = 1
+# learner在读取样本池时缓存在本地的队列大小倍数, 默认为4足够, 容器内存紧张则需要调小
+replay_buffer_cache_multiplier = 4
+# 采用zmq + 共享内存方式存储样本时开启的处理样本的进程数目
+batch_process_for_batch_manager = 2
+# 下面是reverb在创建时可能采用到的
+rnn_time_steps = 4
+rnn_states = ["lstm_cell", "lstm_hidden"]
+# learner支持旁路操作
+use_bypass = false
+bypass_per_minutes = 10
+bypass_dir = "/data/bypass"
+# 是否启动learner_server, 支持aisrv和learner之间采用zmq通信才能开启
+use_learner_server = false
+learner_send_sample_server_count = 2
+# 下面是算法侧配置
+enable_mixed_precision = true
+max_grad_norm = 5
+# 下面是replay buffer的相关配置
+replay_buffer_capacity = 10000
+preload_ratio = 1.0
+
+# pytorch读取reverb采取的数据方案
+pytorch_read_data_from_reverb_type = 1
+learner_should_clear_data = false

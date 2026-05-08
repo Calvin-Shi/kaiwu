@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>进程列表 - 火焰图监控</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>可监控进程列表</h1>
+            <p class="description">点击操作列链接生成对应进程的火焰图（默认采样10秒）</p>
+            <div class="base-url">
+                <span class="label">服务地址：</span>
+                <a href="$base_url" target="_blank">$base_url</a>
+            </div>
+        </header>
+
+        <section class="processes-section">
+            <table class="processes-table">
+                <thead>
+                    <tr>
+                        <th>PID</th>
+                        <th>父进程ID</th>
+                        <th>进程名</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>命令行</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    $processes_html
+                </tbody>
+            </table>
+        </section>
+
+        <footer class="footer">
+            <p>更新时间：$update_time</p>
+            <p>基于 py-spy + memray 构建 | 支持 Python 3.7+</p>
+        </footer>
+    </div>
+</body>
+</html>

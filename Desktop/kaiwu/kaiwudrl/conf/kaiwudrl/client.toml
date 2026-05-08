@@ -1,0 +1,15 @@
+[client]
+# 加载业务的app配置
+app_configure_file = "conf/configure_app.toml"
+# 加载项目的默认配置
+project_default_file = "/root/tools/conf/project_default.toml"
+# 加载项目的默认可配置项
+project_configurable_check_file = "/root/tools/conf/project_configurable.toml"
+# 进程名字
+svr_name = "client"
+# 七彩石组名
+rainbow_group = "client"
+# IP
+aisvr_ip = "127.0.0.1"
+# 端口
+aisvr_port = "8000"

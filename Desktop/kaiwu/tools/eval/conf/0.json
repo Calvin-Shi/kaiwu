@@ -1,0 +1,22 @@
+{
+    "lineups": [
+        {
+            "code": "DiRenjie",
+            "lineup": [
+                {
+                    "hero_id": 133
+                }
+            ]
+        },
+        {
+            "code": "DiRenjie",
+            "lineup": [
+                {
+                    "hero_id": 133
+                }
+            ]
+        }
+    ],
+    "main_agent": 0,
+    "game_id": "119900_1_1"
+}

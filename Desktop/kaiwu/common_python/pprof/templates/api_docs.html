@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$service_name - API文档</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- 页面头部 -->
+        <header class="header">
+            <h1>$service_name</h1>
+            <p class="description">$service_desc</p>
+            <div class="base-url">
+                <span class="label">服务地址：</span>
+                <a href="$base_url" target="_blank">$base_url</a>
+            </div>
+        </header>
+
+        <!-- 核心接口文档区域 -->
+        <section class="endpoints-section">
+            <h2>接口列表</h2>
+            <div class="endpoints-list">
+                $endpoints_html
+            </div>
+        </section>
+
+        <!-- 错误码参考区域 -->
+        <section class="errors-section">
+            <h2>通用错误码</h2>
+            <table class="errors-table">
+                <thead>
+                    <tr>
+                        <th>错误码</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    $errors_html
+                </tbody>
+            </table>
+        </section>
+
+        <!-- 依赖说明区域 -->
+        <section class="deps-section">
+            <h2>依赖要求</h2>
+            <ul class="deps-list">
+                $deps_html
+            </ul>
+        </section>
+
+        <!-- 页面底部 -->
+        <footer class="footer">
+            <p>更新时间：$update_time</p>
+            <p>基于 py-spy + memray 构建 | 支持 Python 3.7+</p>
+        </footer>
+    </div>
+</body>
+</html>
