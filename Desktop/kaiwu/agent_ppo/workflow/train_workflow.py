@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2025 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
@@ -16,15 +16,15 @@ from agent_ppo.feature.definition import (
     build_frame,
     FrameCollector,
     NONE_ACTION,
+    lineup_iterator_roundrobin_camp_heroes,
 )
-from kaiwu_agent.utils.common_func import attached
 from agent_ppo.conf.conf import GameConfig
 from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
 from tools.metrics_utils import get_training_metrics
+from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 
-@attached
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # Whether the agent is training, corresponding to do_predicts
     # 智能体是否进行训练
@@ -38,6 +38,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         logger=logger,
     )
 
+    # Lineup iterator (112:Luban, 133:DiRenjie)
+    # 阵容迭代器 (112:鲁班， 133:狄仁杰)
+    lineup_iterator = lineup_iterator_roundrobin_camp_heroes([112, 133])
+
     # Create EpisodeRunner instance
     # 创建 EpisodeRunner 实例
     episode_runner = EpisodeRunner(
@@ -46,6 +50,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         logger=logger,
         monitor=monitor,
         env_conf_manager=env_conf_manager,
+        lineup_iterator=lineup_iterator,
     )
 
     while True:
@@ -56,7 +61,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 if d_learn and len(g_data[index]) > 0:
                     # The learner trains in a while true loop, here learn actually sends samples
                     # learner 采用 while true 训练，此处 learn 实际为发送样本
-                    agent.learn(g_data[index])
+                    agent.send_sample_data(g_data[index])
             g_data.clear()
 
             now = time.time()
@@ -66,17 +71,52 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
 
 class EpisodeRunner:
-    def __init__(self, env, agents, logger, monitor, env_conf_manager):
+    def __init__(self, env, agents, logger, monitor, env_conf_manager, lineup_iterator):
         self.env = env
         self.agents = agents
         self.logger = logger
         self.monitor = monitor
         self.env_conf_manager = env_conf_manager
+        self.lineup_iterator = lineup_iterator
         self.agent_num = len(agents)
         self.episode_cnt = 0
-        self.predict_success_count = 0
-        self.load_model_success_count = 0
         self.last_report_monitor_time = 0
+
+    def _call_init_config(self, usr_conf):
+        """Call init_config on both agents to get summoner skill selections,
+        then inject the results into usr_conf.
+        调用双方 agent 的 init_config 获取召唤师技能选择，并注入 usr_conf。
+        """
+        blue_hero_ids, red_hero_ids = EnvConfManager.extract_hero_ids_from_usr_conf(usr_conf)
+
+        # camp_keys[i] is the camp key for agents[i] based on monitor_side
+        # monitor_side 的 agent 对应 blue/red 取决于 monitor_side 配置
+        monitor_side = self.env_conf_manager.get_monitor_side()
+        camp_keys = ["blue_camp", "red_camp"]
+
+        for agent_idx, agent in enumerate(self.agents):
+            # Determine which camp this agent controls
+            # 确定该 agent 控制哪个阵营
+            if agent_idx == 0:
+                my_hero_ids = blue_hero_ids
+                opponent_hero_ids = red_hero_ids
+                camp_key = camp_keys[0]
+            else:
+                my_hero_ids = red_hero_ids
+                opponent_hero_ids = blue_hero_ids
+                camp_key = camp_keys[1]
+
+            config_data = {
+                "my_camp": camp_key,
+                "my_heroes": my_hero_ids,
+                "opponent_heroes": opponent_hero_ids,
+            }
+
+            select_skills = agent.init_config(config_data)
+            EnvConfManager.inject_select_skills(usr_conf, camp_key, select_skills)
+            self.logger.info(
+                f"Agent[{agent_idx}] init_config: camp={camp_key}, select_skills={select_skills}"
+            )
 
     def run_episodes(self):
         # Single environment process
@@ -96,16 +136,24 @@ class EpisodeRunner:
             # Update environment configuration
             # Can use a list of length 2 to pass in the lineup id of the current game
             # 更新对局配置, 可以用长度为2的列表传入当前对局的阵容id
-            usr_conf, is_eval, monitor_side = self.env_conf_manager.update_config()
+            lineup = next(self.lineup_iterator)
+            usr_conf, is_eval, monitor_side = self.env_conf_manager.update_config(lineup)
 
-            usr_conf["episode"]["eval_opponent_type"] = random.choice(["common_ai","134169","130716"])
+            # Call init_config on agents to get summoner skill selections
+            # 调用 agent 的 init_config 获取召唤师技能选择，注入 usr_conf
+            self._call_init_config(usr_conf)
+
             # Start a new environment
             # 启动新对局，返回初始环境状态
-            observation, extra_info = self.env.reset(usr_conf=usr_conf)
+
+            env_obs = self.env.reset(usr_conf=usr_conf)
             # Disaster recovery
             # 容灾
-            if self._handle_disaster_recovery(extra_info):
+            if handle_disaster_recovery(env_obs, self.logger):
                 break
+
+            observation = env_obs["observation"]
+            extra_info = env_obs["extra_info"]
 
             # Reset agents
             # 重置智能体
@@ -127,8 +175,8 @@ class EpisodeRunner:
             # 回报初始化
             for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                 if do_sample:
-                    reward = agent.reward_manager.result(observation[i]["frame_state"])
-                    observation[i]["reward"] = reward
+                    reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
+                    observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += reward["reward_sum"]
 
             while True:
@@ -141,41 +189,37 @@ class EpisodeRunner:
                 ):
                     if do_predict:
                         if not is_eval:
-                            actions[index] = agent.predict(observation[index])
+                            actions[index] = agent.predict(observation[str(index)])
                         else:
-                            actions[index] = agent.exploit(observation[index])
-                        self.predict_success_count += 1
+                            actions[index] = agent.exploit(observation[str(index)])
 
                         # Only sample when do_sample=True and is_eval=False
                         # 评估对局数据不采样，不是训练中最新模型产生的数据不采样
                         if not is_eval and do_sample:
-                            frame = build_frame(agent, observation[index])
+                            frame = build_frame(agent, observation[str(index)])
                             frame_collector.save_frame(frame, agent_id=index)
 
                 # Step forward
                 # 推进环境到下一帧，得到新的状态
-                frame_no, observation, terminated, truncated, extra_info = self.env.step(actions)
+                env_reward, env_obs = self.env.step(actions)
                 # Disaster recovery
                 # 容灾
-                if self._handle_disaster_recovery(extra_info):
+                if handle_disaster_recovery(env_obs, self.logger):
                     break
+
+                frame_no = env_obs["frame_no"]
+                observation = env_obs["observation"]
+                extra_info = env_obs["extra_info"]
+                terminated = env_obs["terminated"]
+                truncated = env_obs["truncated"]
 
                 # Reward generation
                 # 计算回报，作为当前环境状态observation的一部分
                 for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                     if do_sample:
-                        reward = agent.reward_manager.result(observation[i]["frame_state"])
-                        observation[i]["reward"] = reward
+                        reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
+                        observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += reward["reward_sum"]
-
-                now = time.time()
-                if now - self.last_report_monitor_time >= 60:
-                    monitor_data = {
-                        "actor_predict_succ_cnt": self.predict_success_count,
-                        "actor_load_last_model_succ_cnt": self.load_model_success_count,
-                    }
-                    self.monitor.put_data({os.getpid(): monitor_data})
-                    self.last_report_monitor_time = now
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
@@ -190,13 +234,17 @@ class EpisodeRunner:
                         if not is_eval and do_sample:
                             frame_collector.save_last_frame(
                                 agent_id=i,
-                                reward=observation[i]["reward"]["reward_sum"],
+                                reward=observation[str(i)]["reward"]["reward_sum"],
                             )
 
-                    monitor_data = {}
-                    if self.monitor and is_eval:
-                        monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
-                        self.monitor.put_data({os.getpid(): monitor_data})
+                    now = time.time()
+                    if now - self.last_report_monitor_time >= 60:
+                        monitor_data = {"episode_cnt": self.episode_cnt}
+                        if self.monitor:
+                            if is_eval:
+                                monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
+                            self.monitor.put_data({os.getpid(): monitor_data})
+                            self.last_report_monitor_time = now
 
                     # Sample process
                     # 进行样本处理，准备训练
@@ -236,7 +284,6 @@ class EpisodeRunner:
                     # Training model, "latest" - latest model, "random" - random model from the model pool
                     # 加载训练过的模型，可以选择最新模型，也可以选择随机模型 "latest" - 最新模型, "random" - 模型池中随机模型
                     agent.load_model(id="latest")
-                    self.load_model_success_count += 1
                 else:
                     # Opponent model, model_id is checked from kaiwu.json
                     # 选择kaiwu.json中设置的对手模型, model_id 即 opponent_agent，必须设置正确否则报错
@@ -254,16 +301,4 @@ class EpisodeRunner:
                         self.do_samples[i] = False
             # Reset agent
             # 重置agent
-            agent.reset(observation[i])
-
-    def _handle_disaster_recovery(self, extra_info):
-        # Handle disaster recovery logic
-        # 处理容灾逻辑
-        result_code = extra_info.get("result_code", 0)
-        result_message = extra_info.get("result_message", "")
-        if result_code < 0:
-            self.logger.error(f"Env run error, result_code: {result_code}, result_message: {result_message}")
-            raise RuntimeError(result_message)
-        elif result_code > 0:
-            return True
-        return False
+            agent.reset(observation[str(i)])

@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2024 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 """
 
-from enum import Enum
 from agent_ppo.feature.feature_process.feature_normalizer import FeatureNormalizer
 import configparser
 import os
 import math
-from collections import OrderedDict
 
 
 class OrganProcess:
-    def __init__(self, camp,logger):
+    def __init__(self, camp):
         self.normalizer = FeatureNormalizer()
         self.main_camp = camp
 
@@ -31,8 +29,6 @@ class OrganProcess:
         self.view_dist = 15000
         self.one_unit_feature_num = 7
         self.unit_buff_num = 1
-
-        self.logger = logger
 
     def get_organ_config(self):
         self.config = configparser.ConfigParser()
@@ -61,9 +57,7 @@ class OrganProcess:
 
         local_vector_feature = []
 
-        main_camp_organ_vector_feature = self.generate_one_type_organ_feature(self.main_camp_organ_dict, "main_camp")
-        local_vector_feature.extend(main_camp_organ_vector_feature)
-
+        # Generate features for enemy team's towers
         # 生成敌方阵营的防御塔特征
         enemy_camp_organ_vector_feature = self.generate_one_type_organ_feature(self.enemy_camp_organ_dict, "enemy_camp")
         local_vector_feature.extend(enemy_camp_organ_vector_feature)
@@ -75,11 +69,11 @@ class OrganProcess:
         self.main_camp_hero_dict.clear()
         self.enemy_camp_hero_dict.clear()
         for hero in frame_state["hero_states"]:
-            if hero["actor_state"]["camp"] == self.main_camp:
-                self.main_camp_hero_dict[hero["actor_state"]["config_id"]] = hero
+            if hero["camp"] == self.main_camp:
+                self.main_camp_hero_dict[hero["config_id"]] = hero
                 self.main_hero_info = hero
             else:
-                self.enemy_camp_hero_dict[hero["actor_state"]["config_id"]] = hero
+                self.enemy_camp_hero_dict[hero["config_id"]] = hero
 
     def generate_organ_info_dict(self, frame_state):
         self.main_camp_organ_dict.clear()
@@ -89,10 +83,10 @@ class OrganProcess:
             organ_camp = organ["camp"]
             organ_subtype = organ["sub_type"]
             if organ_camp == self.main_camp:
-                if organ_subtype == "ACTOR_SUB_TOWER":
+                if organ_subtype == 21:
                     self.main_camp_organ_dict["tower"] = organ
             else:
-                if organ_subtype == "ACTOR_SUB_TOWER":
+                if organ_subtype == 21:
                     self.enemy_camp_organ_dict["tower"] = organ
 
     def generate_one_type_organ_feature(self, one_type_organ_info, camp):
@@ -125,9 +119,6 @@ class OrganProcess:
 
         if num_organs_considered < self.unit_buff_num:
             self.no_organ_feature(vector_feature, num_organs_considered)
-
-        self.logger.info(f"[{camp} organ {num_organs_considered}] :{vector_feature[-self.one_unit_feature_num:]}")
-        
         return vector_feature
 
     def no_organ_feature(self, vector_feature, num_organs_considered):
@@ -162,7 +153,7 @@ class OrganProcess:
 
     def belong_to_main_camp(self, organ, vector_feature):
         value = 0.0
-        if organ["camp"] == self.main_hero_info["actor_state"]["camp"]:
+        if organ["camp"] == self.main_hero_info["camp"]:
             value = 1.0
         vector_feature.append(value)
 
@@ -180,7 +171,7 @@ class OrganProcess:
 
     def relative_location_x(self, organ, vector_feature):
         organ_location_x = organ["location"]["x"]
-        location_x = self.main_hero_info["actor_state"]["location"]["x"]
+        location_x = self.main_hero_info["location"]["x"]
         x_diff = organ_location_x - location_x
         if self.transform_camp2_to_camp1 and organ_location_x != 100000:
             x_diff = -x_diff
@@ -189,7 +180,7 @@ class OrganProcess:
 
     def relative_location_z(self, organ, vector_feature):
         organ_location_z = organ["location"]["z"]
-        location_z = self.main_hero_info["actor_state"]["location"]["z"]
+        location_z = self.main_hero_info["location"]["z"]
         z_diff = organ_location_z - location_z
         if self.transform_camp2_to_camp1 and organ_location_z != 100000:
             z_diff = -z_diff

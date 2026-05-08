@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2025 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 """
 
 
-from kaiwu_agent.utils.common_func import create_cls, Frame, attached
+from common_python.utils.common_func import create_cls, Frame
 from agent_diy.conf.conf import Config
 import numpy as np
 import collections
@@ -17,7 +17,6 @@ import itertools
 import os
 import json
 
-SampleData = create_cls("SampleData", npdata=None)
 
 ObsData = create_cls("ObsData", feature=None, legal_action=None, lstm_cell=None, lstm_hidden=None)
 
@@ -34,10 +33,16 @@ ActData = create_cls(
     lstm_hidden=None,
 )
 
+# SampleData for training, total dimension is sum of all data_shapes
+# SampleData 用于训练，总维度是所有 data_shapes 的总和
+SampleData = create_cls(
+    "SampleData",
+    sample=1,
+)
+
 NONE_ACTION = [0, 15, 15, 15, 15, 0]
 
 
-@attached
 def sample_process(collector):
     return collector.sample_process()
 
@@ -55,13 +60,3 @@ class FrameCollector:
 
     def sample_process(self):
         return
-
-
-@attached
-def SampleData2NumpyData(g_data):
-    return g_data.npdata
-
-
-@attached
-def NumpyData2SampleData(s_data):
-    return SampleData(npdata=s_data)

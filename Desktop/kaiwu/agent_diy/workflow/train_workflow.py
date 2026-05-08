@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2025 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 """
 
 
-from kaiwu_agent.utils.common_func import Frame, attached
 import random
 
 from agent_diy.feature.definition import (
@@ -19,9 +18,9 @@ from agent_diy.feature.definition import (
 from tools.env_conf_manager import EnvConfManager
 from tools.model_pool_utils import get_valid_model_pool
 from tools.metrics_utils import get_training_metrics
+from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 
 
-@attached
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # hok1v1 environment
     # hok1v1环境

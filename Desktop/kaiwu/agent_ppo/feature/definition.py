@@ -1,19 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2025 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 """
 
 
-from kaiwu_agent.utils.common_func import create_cls, Frame, attached
+from common_python.utils.common_func import create_cls, Frame
 import numpy as np
 import collections
+import random
 from agent_ppo.conf.conf import Config
+import itertools
 
-SampleData = create_cls("SampleData", npdata=None)
+# Loop through camps, shuffling camps before each major loop
+# 循环返回camps, 每次大循环前对camps进行shuffle
+def _lineup_iterator_shuffle_cycle(camps):
+    while True:
+        random.shuffle(camps)
+        for camp in camps:
+            yield camp
+
+
+# Specify single-side multi-agent lineups, looping through all pairwise combinations
+# 指定单边多智能体阵容，两两组合循环
+def lineup_iterator_roundrobin_camp_heroes(camp_heroes=None):
+    if not camp_heroes:
+        raise Exception(f"camp_heroes is empty")
+
+    camps = []
+    for lineups in itertools.product(camp_heroes, camp_heroes):
+        camp = []
+        for lineup in lineups:
+            camp.append(lineup)
+        camps.append(camp)
+    return _lineup_iterator_shuffle_cycle(camps)
+
 
 ObsData = create_cls("ObsData", feature=None, legal_action=None, lstm_cell=None, lstm_hidden=None)
 
@@ -30,10 +54,16 @@ ActData = create_cls(
     lstm_hidden=None,
 )
 
+# SampleData for training, total dimension is sum of all data_shapes
+# SampleData 用于训练，总维度是所有 data_shapes 的总和
+SampleData = create_cls(
+    "SampleData",
+    sample=sum([shape[0] for shape in Config.data_shapes]),
+)
+
 NONE_ACTION = [0, 15, 15, 15, 15, 0]
 
 
-@attached
 def sample_process(collector):
     return collector.sample_process()
 
@@ -45,10 +75,10 @@ def build_frame(agent, observation):
     is_train = False
     frame_state = observation["frame_state"]
     hero_list = frame_state["hero_states"]
-    frame_no = frame_state["frameNo"]
+    frame_no = frame_state["frame_no"]
     for hero in hero_list:
-        hero_camp = hero["actor_state"]["camp"]
-        hero_hp = hero["actor_state"]["hp"]
+        hero_camp = hero["camp"]
+        hero_hp = hero["hp"]
         if hero_camp == agent.hero_camp:
             is_train = True if hero_hp > 0 else False
 
@@ -76,7 +106,7 @@ def build_frame(agent, observation):
         next_value=0,
         advantage=0,
         prob=prob,
-        sub_action=sub_action_mask[action[0]],
+        sub_action=sub_action_mask[str(action[0])],
         lstm_info=np.concatenate([lstm_cell.flatten(), lstm_hidden.flatten()]).reshape([-1]),
         is_train=False if action[0] < 0 else is_train,
     )
@@ -174,7 +204,7 @@ class FrameCollector:
             sample[s_idx : s_idx + split_shape[0]] = sample_batch[:, idx : idx + one_shape].reshape([-1])
             idx += one_shape
             s_idx += split_shape[0]
-        return SampleData(npdata=sample.astype(np.float32))
+        return sample.astype(np.float32)
 
     # Create the sample for the current frame
     # 根据LSTM_TIME_STEPS，组合送入样本池的样本
@@ -228,8 +258,10 @@ class FrameCollector:
                 cnt += 1
                 if cnt == self._LSTM_FRAME:
                     cnt = 0
-                    sample = self._reshape_lstm_batch_sample(sample_batch, sample_lstm)
-                    self.m_replay_buffer[i].append(sample)
+                    sample_array = self._reshape_lstm_batch_sample(sample_batch, sample_lstm)
+                    # Wrap sample array into SampleData object
+                    # 将样本数组包装为 SampleData 对象
+                    self.m_replay_buffer[i].append(SampleData(sample=sample_array))
                     sample_lstm = rl_info.lstm_info
 
     def _clip_reward(self, reward, max=100, min=-100):
@@ -241,13 +273,3 @@ class FrameCollector:
 
     def __len__(self):
         return max([len(agent_samples) for agent_samples in self.rl_data_map])
-
-
-@attached
-def SampleData2NumpyData(g_data):
-    return g_data.npdata
-
-
-@attached
-def NumpyData2SampleData(s_data):
-    return SampleData(npdata=s_data)

@@ -21,8 +21,8 @@ auto_switch_monitor_side = true
 # 3. 自定义的模型id：与指定的模型对战，需要先将模型上传至模型管理，并且将模型ID配置在kaiwu.json中，然后在此处进行引用
 opponent_agent = "selfplay"
 
-# Evaluation interval (unit: games), Type: integer, value range: integer >= 1
-# 评估间隔(单位局)，类型整型，取值范围为大于等于1的整数
+# Evaluation interval (unit: games). Type: integer, value range: integer >= 2, default: 10
+# 评估间隔(单位局)，类型整型，取值范围为大于等于2的整数，默认值10
 eval_interval = 10
 
 # Evaluation opponent type, Type: string, value range: [selfplay, common_ai, custom model ID]
@@ -34,13 +34,13 @@ eval_opponent_type = "common_ai"
 # Blue camp lineup configuration
 # 蓝方阵容配置
 [[lineups.blue_camp]]
-# hero_id, Type: integer, value range: 111:Lady Sun
-# 英雄ID，类型整数，取值范围: 111:孙尚香
-hero_id = 111
+# hero_id, Type: integer, options: 112: Luban No.7, 133: Di Renjie
+# 英雄ID, 类型整数, 可选 112: 鲁班七号, 133: 狄仁杰
+hero_id = 112
 
 # Red camp lineup configuration
 # 红方阵容配置
 [[lineups.red_camp]]
-# hero_id, Type: integer, value range: 111:Lady Sun
-# 英雄ID，类型整数，取值范围: 111:孙尚香
-hero_id = 111
+# hero_id, Type: integer, options: 112: Luban No.7, 133: Di Renjie
+# 英雄ID, 类型整数, 可选 112: 鲁班七号, 133: 狄仁杰
+hero_id = 112

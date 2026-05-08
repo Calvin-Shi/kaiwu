@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2025 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
@@ -14,29 +14,35 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import os
+import random
 from agent_ppo.model.model import Model
 from agent_ppo.feature.definition import *
 import numpy as np
-from kaiwu_agent.agent.base_agent import (
-    BaseAgent,
-    predict_wrapper,
-    exploit_wrapper,
-    learn_wrapper,
-    save_model_wrapper,
-    load_model_wrapper,
-    reset_wrapper,
-    load_opponent_agent_wrapper,
-)
+from kaiwudrl.interface.agent import BaseAgent
 
 from agent_ppo.conf.conf import Config
-from kaiwu_agent.utils.common_func import attached
 from agent_ppo.feature.reward_process import GameRewardManager
 from torch.optim.lr_scheduler import LambdaLR
 from agent_ppo.algorithm.algorithm import Algorithm
 from agent_ppo.feature.feature_process import FeatureProcess
 
 
-@attached
+# Available summoner skills / 可选召唤师技能
+SUMMONER_SKILL_MAP = {
+    80102: "治疗",
+    80109: "疾跑",
+    80104: "惩击",
+    80108: "终结",
+    80110: "狂暴",
+    80105: "干扰",
+    80103: "晕眩",
+    80107: "净化",
+    80121: "弱化",
+    80115: "闪现",
+}
+SUMMONER_SKILL_IDS = list(SUMMONER_SKILL_MAP.keys())
+
+
 class Agent(BaseAgent):
     def __init__(self, agent_type="player", device=None, logger=None, monitor=None):
         self.cur_model_name = ""
@@ -90,61 +96,82 @@ class Agent(BaseAgent):
         else:
             return 1.0 - ((1.0 - self.target_lr / self.lr) * step / self.target_step)
 
-    @reset_wrapper
+    def init_config(self, config_data):
+        # Select summoner skill for each hero based on hero lineup of both camps
+        # 根据双方阵营英雄阵容，为己方每个英雄选择召唤师技能
+        my_heroes = config_data.get("my_heroes", [])
+        select_skills = {}
+        for hero_id in my_heroes:
+            skill_id = random.choice(SUMMONER_SKILL_IDS)
+            select_skills[hero_id] = skill_id
+        return select_skills
+
     def reset(self, observation):
         # Reset function, called at the beginning of each episode
         # 重置函数，每局开始时调用
-        self.hero_camp = observation["player_camp"]
+        self.hero_camp = observation["camp"]
         self.player_id = observation["player_id"]
         self.lstm_hidden = np.zeros([self.lstm_unit_size])
         self.lstm_cell = np.zeros([self.lstm_unit_size])
-        self.reward_manager = GameRewardManager(self.player_id,self.logger)
-        self.feature_processes = FeatureProcess(f"PLAYERCAMP_{self.hero_camp}",self.logger)
+        self.reward_manager = GameRewardManager(self.player_id)
+        self.feature_processes = FeatureProcess(self.hero_camp)
+
+        # 新增：提前初始化，防止 predict 崩溃时后续环节报 AttributeError
+        self.obs_data = None
+        self.act_data = None
 
     def _model_inference(self, list_obs_data):
+        feature = [obs_data.feature for obs_data in list_obs_data]
+        legal_action = [obs_data.legal_action for obs_data in list_obs_data]
+        lstm_cell = [obs_data.lstm_cell for obs_data in list_obs_data]
+        lstm_hidden = [obs_data.lstm_hidden for obs_data in list_obs_data]
 
-        B = len(list_obs_data)
+        input_list = [np.array(feature), np.array(lstm_cell), np.array(lstm_hidden)]
+        torch_inputs = [torch.from_numpy(nparr).to(torch.float32) for nparr in input_list]
+        for i, data in enumerate(torch_inputs):
+            data = data.reshape(-1)
+            torch_inputs[i] = data.float()
 
-        # 使用网络进行推理
-        feature = np.stack([o.feature      for o in list_obs_data], axis=0).astype(np.float32)  # [B, L]
-        legal   = np.stack([o.legal_action for o in list_obs_data], axis=0)                     # 仅用于采样
-        h0_np   = np.stack([o.lstm_hidden  for o in list_obs_data], axis=0).astype(np.float32)  # [B, H]
-        c0_np   = np.stack([o.lstm_cell    for o in list_obs_data], axis=0).astype(np.float32)  # [B, H]
+        feature_t, lstm_cell_t, lstm_hidden_t = torch_inputs
+        feature_vec = feature_t.reshape(-1, self.seri_vec_split_shape[0][0])
+        lstm_hidden_state = lstm_hidden_t.reshape(-1, self.lstm_unit_size)
+        lstm_cell_state = lstm_cell_t.reshape(-1, self.lstm_unit_size)
 
-        # 2) 转 torch 放到 device，上下文 eval+no_grad
-        feature_t = torch.from_numpy(feature).to(self.device)
-        h0_t      = torch.from_numpy(h0_np).to(self.device)
-        c0_t      = torch.from_numpy(c0_np).to(self.device)
+        # Convert legal_action to tensor [batch, legal_action_dim]
+        la_np = np.array(legal_action, dtype=np.float32)
+        la_tensor = torch.from_numpy(la_np).reshape(-1, int(np.sum(self.legal_action_size)))
 
+        format_inputs = [feature_vec, lstm_hidden_state, lstm_cell_state]
 
         self.model.set_eval_mode()
         with torch.no_grad():
-            logits_t, value_t, cT_t, hT_t = self.model([feature_t, h0_t, c0_t], inference=True)
+            output_list = self.model(format_inputs, inference=True, legal_action=la_tensor)
 
-        # 4) 转回 numpy（注意 cT/hT: [1, B, H] -> [B, H]）
-        logits = logits_t.cpu().numpy()                         # [B, sum(label_dims)]
-        value  = value_t.squeeze(-1).cpu().numpy()                          # [B, 1] 或 [B,]
-        cT     = cT_t.squeeze(0).contiguous().cpu().numpy()     # [B, H]
-        hT     = hT_t.squeeze(0).contiguous().cpu().numpy()     # [B, H]
+        logits, value, _lstm_cell, _lstm_hidden, action_list, d_action_list, flat_prob, flat_d_prob = output_list
 
+        _lstm_cell = _lstm_cell.squeeze(0).numpy()
+        _lstm_hidden = _lstm_hidden.squeeze(0).numpy()
+        value_np = value.numpy()
+        flat_prob_np = flat_prob.numpy()
+        flat_d_prob_np = flat_d_prob.numpy()
+        action_np = [a.numpy() for a in action_list]
+        d_action_np = [a.numpy() for a in d_action_list]
 
         list_act_data = []
-        for i in range(B):
-            prob, d_prob, action, d_action = self._sample_masked_action(logits[i], legal[i])
+        for i in range(len(legal_action)):
             list_act_data.append(
                 ActData(
-                    action=action,
-                    d_action=d_action,
-                    prob=prob,
-                    d_prob=d_prob,
-                    value=value[i],
-                    lstm_cell=cT[i],
-                    lstm_hidden=hT[i],
+                    action=[int(a[i]) for a in action_np],
+                    d_action=[int(a[i]) for a in d_action_np],
+                    prob=[flat_prob_np[i].tolist()],
+                    d_prob=[flat_d_prob_np[i].tolist()],
+                    value=value_np,
+                    lstm_cell=_lstm_cell[i],
+                    lstm_hidden=_lstm_hidden[i],
                 )
             )
         return list_act_data
 
-    @predict_wrapper
     def predict(self, observation):
         # Prediction function, usually called during training
         # Returns a random sampling action
@@ -155,7 +182,6 @@ class Agent(BaseAgent):
         action = self.action_process(observation, act_data, True)
         return action
 
-    @exploit_wrapper
     def exploit(self, observation):
         # Exploitation function, usually called during evaluation
         # Returns the action with the highest probability
@@ -186,11 +212,9 @@ class Agent(BaseAgent):
             # 采用最大概率动作 d_action
             return act_data.d_action
 
-    @learn_wrapper
     def learn(self, list_sample_data):
         return self.algorithm.learn(list_sample_data)
 
-    @save_model_wrapper
     def save_model(self, path=None, id="1"):
         # To save the model, it can consist of multiple files, and it is important to ensure that
         #  each filename includes the "model.ckpt-id" field.
@@ -199,7 +223,6 @@ class Agent(BaseAgent):
         torch.save(self.model.state_dict(), model_file_path)
         self.logger.info(f"save model {model_file_path} successfully")
 
-    @load_model_wrapper
     def load_model(self, path=None, id="1"):
         # When loading the model, you can load multiple files, and it is important to ensure that
         # each filename matches the one used during the save_model process.
@@ -217,7 +240,6 @@ class Agent(BaseAgent):
             self.cur_model_name = model_file_path
             self.logger.info(f"load model {model_file_path} successfully")
 
-    @load_opponent_agent_wrapper
     def load_opponent_agent(self, id="1"):
         # Framework provides loading opponent agent function, no need to implement function content
         # 框架提供的加载对手模型功能，无需实现函数内容
@@ -228,80 +250,3 @@ class Agent(BaseAgent):
         self.act_data = act_data
         self.lstm_cell = act_data.lstm_cell
         self.lstm_hidden = act_data.lstm_hidden
-
-    def _sample_masked_action(self, logits, legal_action):
-        """
-        Sample actions from predicted logits and legal actions
-        return: probability, stochastic and deterministic actions with additional list
-        """
-        """
-        从预测的logits和合法动作中采样动作
-        返回：以列表形式概率、随机和确定性动作
-        """
-
-        prob_list = []
-        d_prob_list = []
-        action_list = []
-        d_action_list = []
-        label_split_size = [sum(self.label_size_list[: index + 1]) for index in range(len(self.label_size_list))]
-        legal_actions = np.split(legal_action, label_split_size[:-1])
-        logits_split = np.split(logits, label_split_size[:-1])
-        for index in range(0, len(self.label_size_list) - 1):
-            probs = self._legal_soft_max(logits_split[index], legal_actions[index])
-            prob_list += list(probs)
-            d_prob_list += list(probs)
-            sample_action = self._legal_sample(probs, use_max=False)
-            action_list.append(sample_action)
-            d_action = self._legal_sample(probs, use_max=True)
-            d_action_list.append(d_action)
-
-        # deals with the last prediction, target
-        # 处理最后的预测，目标
-        index = len(self.label_size_list) - 1
-        target_legal_action_o = np.reshape(
-            legal_actions[index],
-            [
-                self.legal_action_size[0],
-                self.legal_action_size[-1] // self.legal_action_size[0],
-            ],
-        )
-        one_hot_actions = np.eye(self.label_size_list[0])[action_list[0]]
-        one_hot_actions = np.reshape(one_hot_actions, [self.label_size_list[0], 1])
-        target_legal_action = np.sum(target_legal_action_o * one_hot_actions, axis=0)
-
-        legal_actions[index] = target_legal_action
-        probs = self._legal_soft_max(logits_split[-1], target_legal_action)
-        prob_list += list(probs)
-        sample_action = self._legal_sample(probs, use_max=False)
-        action_list.append(sample_action)
-
-        one_hot_actions = np.eye(self.label_size_list[0])[d_action_list[0]]
-        one_hot_actions = np.reshape(one_hot_actions, [self.label_size_list[0], 1])
-        target_legal_action_d = np.sum(target_legal_action_o * one_hot_actions, axis=0)
-
-        probs = self._legal_soft_max(logits_split[-1], target_legal_action_d)
-        d_prob_list += list(probs)
-
-        d_action = self._legal_sample(probs, use_max=True)
-        d_action_list.append(d_action)
-
-        return [prob_list], [d_prob_list], action_list, d_action_list
-
-    def _legal_soft_max(self, input_hidden, legal_action):
-        _lsm_const_w, _lsm_const_e = 1e20, 1e-5
-        _lsm_const_e = 0.00001
-
-        tmp = input_hidden - _lsm_const_w * (1.0 - legal_action)
-        tmp_max = np.max(tmp, keepdims=True)
-        tmp = np.clip(tmp - tmp_max, -_lsm_const_w, 1)
-        tmp = (np.exp(tmp) + _lsm_const_e) * legal_action
-        probs = tmp / np.sum(tmp, keepdims=True)
-        return probs
-
-    def _legal_sample(self, probs, legal_action=None, use_max=False):
-        # Sample with probability, input probs should be 1D array
-        # 根据概率采样，输入的probs应该是一维数组
-        if use_max:
-            return np.argmax(probs)
-
-        return np.argmax(np.random.multinomial(1, probs, size=1))
