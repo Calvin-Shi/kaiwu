@@ -62,6 +62,32 @@ class EntityAttention(nn.Module):
         # 注意力计算：用英雄的特征去 Query 所有小兵的特征
         attn_out, _ = self.attn(q, k, k)
         return attn_out.squeeze(1)                # [Batch, embed_dim]
+# === 【高阶经验 3 的究极进化】：真正的目标锁定注意力机制 ===
+class TargetAttentionHead(nn.Module):
+    def __init__(self, query_dim, entity_dim, embed_dim=64):
+        super().__init__()
+        # Query 映射：把英雄的战斗意图映射到注意力空间
+        self.query_mlp = make_fc_layer(query_dim, embed_dim, gain=np.sqrt(2))
+        # Key 映射：共享权重！把 9 个候选目标的特征映射到注意力空间
+        self.key_mlp = make_fc_layer(entity_dim, embed_dim, gain=np.sqrt(2))
+
+    def forward(self, query_feat, target_seq):
+        # query_feat: [Batch, query_dim]   -> 通常是 combat_branch 的输出 (意图)
+        # target_seq: [Batch, 9, entity_dim] -> 9个候选目标的特征序列
+        
+        q = self.query_mlp(query_feat).unsqueeze(1)    # [Batch, 1, embed_dim]
+        k = self.key_mlp(target_seq)                   # [Batch, 9, embed_dim]
+
+        # 内积计算注意力打分 (Dot-product Attention)
+        # 意图(q) 去匹配 每一个目标的特征(k)
+        # [Batch, 1, embed_dim] x [Batch, embed_dim, 9] -> [Batch, 1, 9]
+        attn_logits = torch.bmm(q, k.transpose(1, 2)).squeeze(1)
+        
+        # 缩放因子，防止梯度消失/爆炸
+        attn_logits = attn_logits / np.sqrt(k.size(-1))
+        
+        # 输出的就是 9 个目标的 logits 分数
+        return attn_logits
 
 
 class Model(nn.Module):
@@ -149,7 +175,11 @@ class Model(nn.Module):
         self.combat_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
         self.head_skill_x = make_fc_layer(128, self.label_size_list[3], gain=0.01)
         self.head_skill_z = make_fc_layer(128, self.label_size_list[4], gain=0.01)
-        self.head_target = make_fc_layer(128, self.label_size_list[5], gain=0.01)
+        self.target_attention = TargetAttentionHead(
+            query_dim=128,               # c_feat (战斗意图) 的维度
+            entity_dim=self.entity_dim,  # 实体特征维度 (7维)
+            embed_dim=64
+        )
 
         # 保留环境原有的 LSTM 相关接口定义 (即使 baseline lite 中未使用)
         self.lstm = torch.nn.LSTM(
@@ -203,7 +233,11 @@ class Model(nn.Module):
         c_feat = self.combat_branch(a_feat)
         logit_skill_x = self.head_skill_x(c_feat)
         logit_skill_z = self.head_skill_z(c_feat)
-        logit_target = self.head_target(c_feat)
+        
+        # 【修改】：使用 Query(意图 c_feat) 和 Keys(实体序列 npc_seq) 直接计算 Target Logits
+        # 这里直接传入 npc_seq，包含 9 个实体。
+        # 即使 npc_seq 里面包含了友军也不怕，因为后续的 legal_action mask 会直接把不能攻击的友军过滤掉（置为 -1e9）！
+        logit_target = self.target_attention(c_feat, npc_seq)
 
         # 组装返回列表 (必须与 LABEL_SIZE_LIST 的顺序严格一致)
         result_list = [

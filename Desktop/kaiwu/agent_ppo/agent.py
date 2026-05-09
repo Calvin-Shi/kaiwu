@@ -127,19 +127,20 @@ class Agent(BaseAgent):
         lstm_hidden = [obs_data.lstm_hidden for obs_data in list_obs_data]
 
         input_list = [np.array(feature), np.array(lstm_cell), np.array(lstm_hidden)]
-        torch_inputs = [torch.from_numpy(nparr).to(torch.float32) for nparr in input_list]
+        
+        # 【修复点 1】：确保输入数据转移到了 self.device (GPU) 上
+        torch_inputs = [torch.from_numpy(nparr).to(torch.float32).to(self.device) for nparr in input_list]
         for i, data in enumerate(torch_inputs):
-            data = data.reshape(-1)
-            torch_inputs[i] = data.float()
+            torch_inputs[i] = data.reshape(-1) # 已经在设备上，直接 reshape 即可
 
         feature_t, lstm_cell_t, lstm_hidden_t = torch_inputs
         feature_vec = feature_t.reshape(-1, self.seri_vec_split_shape[0][0])
         lstm_hidden_state = lstm_hidden_t.reshape(-1, self.lstm_unit_size)
         lstm_cell_state = lstm_cell_t.reshape(-1, self.lstm_unit_size)
 
-        # Convert legal_action to tensor [batch, legal_action_dim]
+        # 【修复点 2】：确保合法动作掩码也转移到了 self.device 上
         la_np = np.array(legal_action, dtype=np.float32)
-        la_tensor = torch.from_numpy(la_np).reshape(-1, int(np.sum(self.legal_action_size)))
+        la_tensor = torch.from_numpy(la_np).to(self.device).reshape(-1, int(np.sum(self.legal_action_size)))
 
         format_inputs = [feature_vec, lstm_hidden_state, lstm_cell_state]
 
@@ -149,13 +150,14 @@ class Agent(BaseAgent):
 
         logits, value, _lstm_cell, _lstm_hidden, action_list, d_action_list, flat_prob, flat_d_prob = output_list
 
-        _lstm_cell = _lstm_cell.squeeze(0).numpy()
-        _lstm_hidden = _lstm_hidden.squeeze(0).numpy()
-        value_np = value.numpy()
-        flat_prob_np = flat_prob.numpy()
-        flat_d_prob_np = flat_d_prob.numpy()
-        action_np = [a.numpy() for a in action_list]
-        d_action_np = [a.numpy() for a in d_action_list]
+        # 【修复点 3】：输出结果必须先调用 .cpu() 才能转为 .numpy()
+        _lstm_cell = _lstm_cell.squeeze(0).cpu().numpy()
+        _lstm_hidden = _lstm_hidden.squeeze(0).cpu().numpy()
+        value_np = value.cpu().numpy()
+        flat_prob_np = flat_prob.cpu().numpy()
+        flat_d_prob_np = flat_d_prob.cpu().numpy()
+        action_np = [a.cpu().numpy() for a in action_list]
+        d_action_np = [a.cpu().numpy() for a in d_action_list]
 
         list_act_data = []
         for i in range(len(legal_action)):
