@@ -16,6 +16,7 @@ class GameConfig:
         "tower_hp_point": 5.0,
         # 前进：鼓励靠近敌方防御塔
         "forward": 0.01,
+        "recall": 1.0,  # <--- 【新增】注册回城奖励及其初始权重
         # 生命值比例差（零和）
         "hp_point": 2.0,
         # 金币差（零和）
@@ -29,6 +30,8 @@ class GameConfig:
         # 法力值比例（零和）
         "ep_rate": 0.5,
     }
+    # 动作空间宏定义
+    RECALL_BUTTON_INDEX = 9  # <--- 【新增】12维离散空间中第9位为回城
     # Time decay factor, used in reward_manager
     # 时间衰减因子，在reward_manager中使用
     TIME_SCALE_ARG = 0
@@ -45,7 +48,7 @@ class GameConfig:
 #   防御塔: is_alive(1) + belong_to_main_camp(1) + location_x(1) + location_z(1)
 #         + relative_location_x(1) + relative_location_z(1) + hp_rate(1) = 7
 class DimConfig:
-    DIM_OF_FEATURE = [50]
+    DIM_OF_FEATURE = [93]
 
 
 # Configuration related to model and algorithms used
@@ -55,7 +58,7 @@ class Config:
     LSTM_TIME_STEPS = 16
     LSTM_UNIT_SIZE = 512
     DATA_SPLIT_SHAPE = [
-        50 + 85,
+        93 + 85,
         1,
         1,
         1,
@@ -80,7 +83,7 @@ class Config:
         LSTM_UNIT_SIZE,
         LSTM_UNIT_SIZE,
     ]
-    SERI_VEC_SPLIT_SHAPE = [(50,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(93,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
@@ -106,7 +109,7 @@ class Config:
     BETA_DECAY_STEPS = 50000
 
     data_shapes = [
-        [(50 + 85) * 16],
+        [(93 + 85) * 16],
         [16],
         [16],
         [16],

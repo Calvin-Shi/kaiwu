@@ -39,6 +39,7 @@ def init_calc_frame_map():
     calc_frame_map["last_hit"] = RewardStruct(2.0)  # 补刀瞬时刺激
     calc_frame_map["anti_camp"] = RewardStruct(1.0) # 防发呆/站桩惩罚
     calc_frame_map["kiting"] = RewardStruct(1.0)    # 极限拉扯奖励
+    calc_frame_map["recall"] = RewardStruct(1.0)
     return calc_frame_map
 
 
@@ -61,6 +62,8 @@ class GameRewardManager:
         
         # 记录英雄最近轨迹，用于防发呆判定
         self.pos_window = []
+        # <--- 【新增】用于防刷分的连续回城帧计数器
+        self.consecutive_recall_frames = 0
 
     def init_max_exp_of_each_hero(self):
         self.m_each_level_max_exp.clear()
@@ -79,10 +82,10 @@ class GameRewardManager:
         self.m_each_level_max_exp[13] = 1778
         self.m_each_level_max_exp[14] = 1984
 
-    def result(self, frame_data):
+    def result(self, frame_data, action=None):
         self.init_max_exp_of_each_hero()
         self.frame_data_process(frame_data)
-        self.get_reward(frame_data, self.m_reward_value)
+        self.get_reward(frame_data, self.m_reward_value, action=action)
 
         frame_no = frame_data["frame_no"]
         if self.time_scale_arg > 0:
@@ -162,18 +165,21 @@ class GameRewardManager:
                 reward_struct.cur_frame_value = 0.0
 
     def calculate_forward(self, main_hero, main_tower, enemy_tower):
+        """
+        纯几何的推进计算：英雄越靠近敌方防御塔，返回值越大。
+        去除了原版要求 hp > 0.99 才计算的限制，改为全时段计算，以便后续做负向惩罚。
+        """
         if main_hero is None or main_tower is None or enemy_tower is None:
             return 0.0
         main_tower_pos = (main_tower["location"]["x"], main_tower["location"]["z"])
         enemy_tower_pos = (enemy_tower["location"]["x"], enemy_tower["location"]["z"])
         hero_pos = (main_hero["location"]["x"], main_hero["location"]["z"])
         
-        forward_value = 0
         dist_hero2emy = math.dist(hero_pos, enemy_tower_pos)
         dist_main2emy = math.dist(main_tower_pos, enemy_tower_pos)
         
-        if main_hero["max_hp"] > 0 and main_hero["hp"] / main_hero["max_hp"] > 0.99 and dist_hero2emy > dist_main2emy:
-            forward_value = (dist_main2emy - dist_hero2emy) / dist_main2emy
+        # 归一化的推进量
+        forward_value = (dist_main2emy - dist_hero2emy) / max(dist_main2emy, 1.0)
         return forward_value
 
     def frame_data_process(self, frame_data):
@@ -196,28 +202,80 @@ class GameRewardManager:
         self.set_cur_calc_frame_vec(self.m_main_calc_frame_map, frame_data, main_camp)
         self.set_cur_calc_frame_vec(self.m_enemy_calc_frame_map, frame_data, enemy_camp)
 
-    def get_reward(self, frame_data, reward_dict):
+    def get_reward(self, frame_data, reward_dict, action=None):
         reward_dict.clear()
         reward_sum, weight_sum = 0.0, 0.0
         
         for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
 
+            # =========================================================
+            # 机制 1：血线门控的推进奖励 (HP-Gated Forward)
+            # =========================================================
             if reward_name == "forward":
-                reward_struct.value = self.m_main_calc_frame_map[reward_name].cur_frame_value
+                cur_forward = self.m_main_calc_frame_map[reward_name].cur_frame_value
+                last_forward = self.m_main_calc_frame_map[reward_name].last_frame_value
+                forward_delta = cur_forward - last_forward
 
-            elif reward_name == "kill":
-                cur_main = self.m_main_calc_frame_map[reward_name].cur_frame_value
-                last_main = self.m_main_calc_frame_map[reward_name].last_frame_value
-                reward_struct.cur_frame_value = cur_main
-                reward_struct.last_frame_value = last_main
-                reward_struct.value = max(cur_main - last_main, 0.0)
+                hp_rate = self.m_main_calc_frame_map["hp_point"].cur_frame_value
+                enemy_hp = self.m_enemy_calc_frame_map["hp_point"].cur_frame_value
+                enemy_alive = enemy_hp > 0
 
-            elif reward_name == "death":
-                cur_main = self.m_main_calc_frame_map[reward_name].cur_frame_value
-                last_main = self.m_main_calc_frame_map[reward_name].last_frame_value
-                reward_struct.cur_frame_value = cur_main
-                reward_struct.last_frame_value = last_main
-                reward_struct.value = max(cur_main - last_main, 0.0)
+                if not enemy_alive:
+                    if hp_rate > 0.3:
+                        # 敌方阵亡且我方健康：激发推塔欲望，放大 5 倍
+                        reward_struct.value = forward_delta * 5.0
+                    else:
+                        # 敌方阵亡但我方残血：触发求生欲，禁止推进
+                        if forward_delta > 0:
+                            # 试图走向敌方基地，给予明确负面惩罚斩断贪念
+                            reward_struct.value = -0.01
+                        else:
+                            # 后退或原地回城，不予惩罚
+                            reward_struct.value = 0.0
+                else:
+                    # 敌方存活时的常规推进奖励
+                    reward_struct.value = forward_delta
+
+            # =========================================================
+            # 机制 2：安全回城的显式动作奖励 (Explicit Recall Reward)
+            # =========================================================
+            elif reward_name == "recall":
+                hp_rate = self.m_main_calc_frame_map["hp_point"].cur_frame_value
+                enemy_hp = self.m_enemy_calc_frame_map["hp_point"].cur_frame_value
+                enemy_alive = enemy_hp > 0
+                
+                # 获取双方坐标计算距离
+                main_hero_pos, enemy_hero_pos = None, None
+                for hero in frame_data.get("hero_states", []):
+                    if hero["runtime_id"] == self.main_hero_player_id:
+                        main_hero_pos = (hero["location"]["x"], hero["location"]["z"])
+                    else:
+                        enemy_hero_pos = (hero["location"]["x"], hero["location"]["z"])
+
+                dist_enemy = 999999.0
+                if main_hero_pos and enemy_hero_pos:
+                    dist_enemy = math.dist(main_hero_pos, enemy_hero_pos)
+
+                # 判断绝对安全环境（引擎尺度下，普通射程约8000，12000以上属于绝对安全区）
+                is_safe = (not enemy_alive) or (dist_enemy > 12000.0)
+
+                # 条件触发：残血 + 环境安全 + 按下回城键
+                if hp_rate <= 0.3 and is_safe and action is not None:
+                    # 提取 button action (假设 action 数组第 0 位为 which_button)
+                    if action[0] == GameConfig.RECALL_BUTTON_INDEX:
+                        self.consecutive_recall_frames += 1
+                        # 防刷分机制：要求必须连续吟唱超过 2 帧才开始发糖
+                        if self.consecutive_recall_frames >= 2:
+                            reward_struct.value = 0.05
+                        else:
+                            reward_struct.value = 0.0
+                    else:
+                        self.consecutive_recall_frames = 0
+                        reward_struct.value = 0.0
+                else:
+                    # 不满足条件时清空打断计数
+                    self.consecutive_recall_frames = 0
+                    reward_struct.value = 0.0
 
             # =========================================================
             # 【核心战术 1】：极限拉扯与白嫖奖励 (HP Trade Bonus)

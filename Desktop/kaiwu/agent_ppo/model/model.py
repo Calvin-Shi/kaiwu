@@ -105,7 +105,7 @@ class Model(nn.Module):
         # 假设基础特征：12(我方) + 7(塔) + 10(战术雷达) = 29维
         self.base_feat_dim = 30
         # 小兵特征：每个小兵5维
-        self.entity_dim = 5
+        self.entity_dim = 7
         self.attn_embed_dim = 64
         
         self.entity_attention = EntityAttention(
@@ -170,18 +170,18 @@ class Model(nn.Module):
         # ========================================================
         # 1. 拆分基础特征与实体特征
         # feature_vec 形状为 [Batch, 49] (29基础 + 20小兵)
-        base_feat = feature_vec[:, :self.base_feat_dim]             # [Batch, 29]
-        soldier_flat = feature_vec[:, self.base_feat_dim:]          # [Batch, 20]
+        base_feat = feature_vec[:, :self.base_feat_dim]             # [Batch, 30]
+        npc_flat = feature_vec[:, self.base_feat_dim:]              # [Batch, 63]  <--- 【修改】：提取 63 维的扁平特征
         
-        # 2. 将扁平的小兵特征 Reshape 为序列 (Sequence)
-        # N=4个小兵，每个 entity_dim=5维
-        soldier_seq = soldier_flat.view(-1, 4, self.entity_dim)     # [Batch, 4, 5]
+        # 2. 将扁平的 NPC 特征 Reshape 为序列 (Sequence)
+        # N=9个实体(4友兵+4敌兵+1野怪)，每个 entity_dim=7维
+        npc_seq = npc_flat.view(-1, 9, self.entity_dim)             # <--- 【修改】：序列长度从 4 改为 9
 
-        # 3. 通过交叉注意力机制，提取出当前局势下“最重要的小兵威胁/收益”
-        attn_out = self.entity_attention(base_feat, soldier_seq)    # [Batch, 64]
+        # 3. 通过交叉注意力机制，提取出当前局势下“最重要的敌/我威胁与资源”
+        attn_out = self.entity_attention(base_feat, npc_seq)        # [Batch, 64]
 
-        # 4. 融合特征，作为 Actor/Critic 的真正输入
-        fused_feat = torch.cat([base_feat, attn_out], dim=1)        # [Batch, 93]
+        # 4. 融合特征，作为后续网络的输入
+        fused_feat = torch.cat([base_feat, attn_out], dim=1)     # [Batch, 93]
 
         # --- Critic 评估分支 ---
         v_feat = self.critic_backbone(fused_feat)                   # <-- 传入 fused_feat

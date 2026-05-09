@@ -175,10 +175,10 @@ class EpisodeRunner:
             # 回报初始化
             for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                 if do_sample:
+                    # 【修复点 1】：这里还在 while 循环外，没有 actions，千万不要传 action=actions[i]！
                     reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                     observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += reward["reward_sum"]
-
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
                 # 初始化默认的actions，如果智能体不进行决策，则env.step使用默认action
@@ -217,7 +217,8 @@ class EpisodeRunner:
                 # 计算回报，作为当前环境状态observation的一部分
                 for i, (do_sample, agent) in enumerate(zip(self.do_samples, self.agents)):
                     if do_sample:
-                        reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
+                        # 【修复点 2】：这里在 step 之后，必须传入 action=actions[i] 来触发回城糖果！
+                        reward = agent.reward_manager.result(observation[str(i)]["frame_state"], action=actions[i])
                         observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += reward["reward_sum"]
 

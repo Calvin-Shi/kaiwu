@@ -1,155 +1,177 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
-###########################################################################
 """
 Author: Tencent AI Arena Authors
-
-小兵（Soldier）特征提取模块。
-
-从 AIFrameState 的 npc_states 中筛选存活小兵（sub_type == 1 且 hp > 0），
-按与我方英雄的欧式距离排序，取最近的 MAX_SOLDIER_NUM 个，提取固定维度特征。
-不足时用 0 填充，保证输出维度恒为 MAX_SOLDIER_NUM * FEATURE_PER_SOLDIER。
-
-集成方式：
-    在 feature_process/__init__.py 中：
-    1. from agent_ppo.feature.feature_process.soldier_process import SoldierProcess
-    2. __init__ 中添加 self.soldier_process = SoldierProcess(camp)
-    3. reset 中添加 self.soldier_process = SoldierProcess(camp)
-    4. 新增方法：
-         def process_soldier_feature(self, frame_state):
-             return self.soldier_process.process_vec_soldier(frame_state)
-    5. process_feature 中拼接：
-         soldier_feature = self.process_soldier_feature(frame_state)
-         feature = main_camp_hero_vector_feature + organ_feature + soldier_feature
-    6. 更新 conf.py 中 DimConfig.DIM_OF_FEATURE 增加 20 维
+兼容最新 Lite 整数协议与旧版字符串协议的 NPC 特征提取模块。
 """
 
+from enum import Enum
 import math
+from collections import OrderedDict
 
-
-# 最大观察小兵数量
-MAX_SOLDIER_NUM = 4
-# 每个小兵的特征维度
-FEATURE_PER_SOLDIER = 5
-# 小兵 sub_type 标识（ACTOR_SUB_SOLDIER）
-SOLDIER_SUB_TYPE = 1
-# 相对坐标归一化用的视野半径（与 hero_process / organ_process 保持一致）
-VIEW_RANGE = 15000.0
-
-
-class SoldierProcess:
-    """
-    小兵特征提取器。
-
-    输出维度：MAX_SOLDIER_NUM * FEATURE_PER_SOLDIER = 4 * 5 = 20
-    每个小兵槽位输出 5 维：
-        [is_exist, is_enemy, hp_rate, relative_loc_x, relative_loc_z]
-    """
-
-    def __init__(self, camp):
-        # 我方阵营标识，如 "PLAYERCAMP_1" / "PLAYERCAMP_2"
+class NpcProcess:
+    def __init__(self, camp, logger=None):
         self.main_camp = camp
-        # 如果我方出生在右上角（PLAYERCAMP_2），需要对坐标做镜像翻转
+        self.logger = logger
         self.transform_camp2_to_camp1 = (camp == "PLAYERCAMP_2")
 
-    # ------------------------------------------------------------------
-    # 公开接口：输入 frame_state，输出固定长度的特征向量
-    # ------------------------------------------------------------------
-    def process_vec_soldier(self, frame_state):
-        """
-        主入口。返回长度为 MAX_SOLDIER_NUM * FEATURE_PER_SOLDIER 的 list[float]。
-        """
-        # 1. 获取我方英雄位置
-        main_hero = self._get_main_hero(frame_state)
-        if main_hero is None:
-            return [0.0] * (MAX_SOLDIER_NUM * FEATURE_PER_SOLDIER)
+        self.max_friendly_soldiers = 4
+        self.max_enemy_soldiers = 4
+        self.monster_count = 1  
 
-        hero_x = main_hero["location"]["x"]
-        hero_z = main_hero["location"]["z"]
+        self.tower_attack_radius = 8800.0
+        self.main_camp_organ_dict = {}
+        self.enemy_camp_organ_dict = {}
 
-        # 2. 从 npc_states 中筛选存活小兵
-        soldiers = self._filter_soldiers(frame_state)
+    def _mirror_pos(self, x, z):
+        if self.transform_camp2_to_camp1 and x != 100000 and z != 100000:
+            return -x, -z
+        return x, z
 
-        # 3. 按与英雄的欧式距离排序
-        soldiers_with_dist = []
-        for soldier in soldiers:
-            sx = soldier["location"]["x"]
-            sz = soldier["location"]["z"]
-            dist = math.hypot(sx - hero_x, sz - hero_z)
-            soldiers_with_dist.append((dist, soldier))
-        soldiers_with_dist.sort(key=lambda x: x[0])
+    def _is_friend(self, camp):
+        return camp == self.main_camp
 
-        # 4. 截断：只取最近的 MAX_SOLDIER_NUM 个
-        nearest = soldiers_with_dist[:MAX_SOLDIER_NUM]
+    def _hp_rate(self, hp, max_hp):
+        max_hp = float(max_hp or 0.0)
+        hp = float(hp or 0.0)
+        r = (hp / max_hp) if max_hp > 0 else 0.0
+        return max(0.0, min(1.0, r))
 
-        # 5. 提取特征 + 填充
-        vector_feature = []
-        for i in range(MAX_SOLDIER_NUM):
-            if i < len(nearest):
-                _, soldier = nearest[i]
-                self._extract_soldier_feature(soldier, hero_x, hero_z, vector_feature)
+    def _npc_feat(self, npc, hero_loc_mirrored, ally_tower=None, enemy_tower=None):
+        if npc is None:
+            return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        loc = npc.get("location", {})
+        abs_x, abs_z = loc.get("x", 100000), loc.get("z", 100000)
+        abs_x, abs_z = self._mirror_pos(abs_x, abs_z)
+
+        ABS_MAX = 60000.0
+        if abs_x == 100000 or abs_z == 100000:
+            abs_x_n = abs_z_n = 0.0
+        else:
+            abs_x_n = (abs_x + ABS_MAX) / (2.0 * ABS_MAX)
+            abs_z_n = (abs_z + ABS_MAX) / (2.0 * ABS_MAX)
+            abs_x_n = 0.0 if abs_x_n < 0.0 else (1.0 if abs_x_n > 1.0 else abs_x_n)
+            abs_z_n = 0.0 if abs_z_n < 0.0 else (1.0 if abs_z_n > 1.0 else abs_z_n)
+
+        REL_HALF, REL_FULL = 15000.0, 30000.0
+        if hero_loc_mirrored is not None and abs_x != 100000 and abs_z != 100000:
+            hx, hz = hero_loc_mirrored
+            rel_x = abs_x - hx
+            rel_z = abs_z - hz
+            rel_x_n = (rel_x + REL_HALF) / REL_FULL
+            rel_z_n = (rel_z + REL_HALF) / REL_FULL
+            rel_x_n = 0.0 if rel_x_n < 0.0 else (1.0 if rel_x_n > 1.0 else rel_x_n)
+            rel_z_n = 0.0 if rel_z_n < 0.0 else (1.0 if rel_z_n > 1.0 else rel_z_n)
+        else:
+            rel_x_n = rel_z_n = 0.0
+
+        hp_rate = self._hp_rate(npc.get("hp", 0), npc.get("max_hp", 0))
+        is_friend = 1.0 if self._is_friend(npc.get("camp")) else 0.0
+
+        in_enemy_tower = 0.0
+        # 【极其重要：兼容新老协议的小兵判定】
+        if str(npc.get("sub_type", "")) in ("ACTOR_SUB_SOLDIER", "11"):
+            in_enemy_tower = self._is_in_tower_range(abs_x, abs_z, enemy_tower)
+
+        feat = [abs_x_n, abs_z_n, rel_x_n, rel_z_n, hp_rate, is_friend, in_enemy_tower]
+        return feat
+
+    def _friend_enemy_soldiers(self, frame_state):
+        friends, enemies = [], []
+        for npc in frame_state.get("npc_states", []):
+            if str(npc.get("sub_type", "")) not in ("ACTOR_SUB_SOLDIER", "11"):
+                continue
+            if npc.get("hp", 0) <= 0:
+                continue
+            (friends if self._is_friend(npc.get("camp")) else enemies).append(npc)
+
+        friends.sort(key=lambda n: n.get("runtime_id", 0))
+        enemies.sort(key=lambda n: n.get("runtime_id", 0))
+        return friends[:self.max_friendly_soldiers], enemies[:self.max_enemy_soldiers]
+
+    def _pick_monsters(self, frame_state, hero_loc_mirrored):
+        candidates = []
+        for npc in frame_state.get("npc_states", []):
+            at = str(npc.get("actor_type", ""))
+            # 【极其重要：兼容新老协议的野怪判定】
+            if at not in ("ACTOR_MONSTER", "ACTOR_TYPE_MONSTER", "2"):
+                continue
+            if npc.get("hp", 0) <= 0:
+                continue
+            
+            loc = npc.get("location", {})
+            nx, nz = self._mirror_pos(loc.get("x", 100000), loc.get("z", 100000))
+            if hero_loc_mirrored is not None and nx != 100000 and nz != 100000:
+                hx, hz = hero_loc_mirrored
+                d = math.hypot(nx - hx, nz - hz)
             else:
-                # Padding：该槽位无小兵，全部填 0
-                vector_feature.extend([0.0] * FEATURE_PER_SOLDIER)
+                d = float("inf")
+            candidates.append((d, npc))
 
-        return vector_feature
+        candidates.sort(key=lambda x: x[0])  
+        picked = [c[1] for c in candidates[:self.monster_count]]
+        while len(picked) < self.monster_count:
+            picked.append(None)
+        return picked
 
-    # ------------------------------------------------------------------
-    # 内部方法
-    # ------------------------------------------------------------------
-    def _get_main_hero(self, frame_state):
-        """从 hero_states 中找到我方英雄。"""
-        for hero in frame_state.get("hero_states", []):
-            if hero.get("camp") == self.main_camp:
-                return hero
+    def _my_hero_loc_mirrored(self, frame_state):
+        # 【极其重要：兼容新老协议的英雄提取嵌套】
+        for h in frame_state.get("hero_states", []):
+            camp = h.get("camp") if h.get("camp") is not None else h.get("actor_state", {}).get("camp")
+            if self._is_friend(camp):
+                loc = h.get("location") or h.get("actor_state", {}).get("location")
+                if loc is None:
+                    return None
+                return self._mirror_pos(loc.get("x", 100000), loc.get("z", 100000))
         return None
 
-    def _filter_soldiers(self, frame_state):
-        """
-        筛选条件：
-        - sub_type == SOLDIER_SUB_TYPE (1)
-        - hp > 0（存活）
-        """
-        soldiers = []
-        for npc in frame_state.get("npc_states", []):
-            if npc.get("sub_type") == SOLDIER_SUB_TYPE and npc.get("hp", 0) > 0:
-                soldiers.append(npc)
-        return soldiers
+    def generate_npc_feature(self, frame_state):
+        self._generate_organ_info_dict(frame_state)
+        ally_tower  = self.main_camp_organ_dict.get("tower")
+        enemy_tower = self.enemy_camp_organ_dict.get("tower")
 
-    def _extract_soldier_feature(self, soldier, hero_x, hero_z, vector_feature):
-        """
-        提取单个小兵的 5 维特征并 append 到 vector_feature：
-            [is_exist, is_enemy, hp_rate, relative_loc_x, relative_loc_z]
-        """
-        # is_exist：该槽位有小兵
-        vector_feature.append(1.0)
+        hero_loc_m = self._my_hero_loc_mirrored(frame_state)
 
-        # is_enemy：小兵阵营与我方不同则为敌方
-        is_enemy = 1.0 if soldier.get("camp") != self.main_camp else 0.0
-        vector_feature.append(is_enemy)
+        my_soldiers, enemy_soldiers = self._friend_enemy_soldiers(frame_state)
+        while len(my_soldiers) < self.max_friendly_soldiers:
+            my_soldiers.append(None)
+        while len(enemy_soldiers) < self.max_enemy_soldiers:
+            enemy_soldiers.append(None)
 
-        # hp_rate：生命值比例，clamp 到 [0, 1]
-        hp = float(soldier.get("hp", 0))
-        max_hp = float(soldier.get("max_hp", 0))
-        hp_rate = 0.0 if max_hp <= 0 else hp / max_hp
-        hp_rate = max(0.0, min(1.0, hp_rate))
-        vector_feature.append(hp_rate)
+        monsters = self._pick_monsters(frame_state, hero_loc_m)
 
-        # relative_loc_x / relative_loc_z：相对英雄的坐标差，归一化到 [-1, 1]
-        sx = soldier["location"]["x"]
-        sz = soldier["location"]["z"]
-        rel_x = sx - hero_x
-        rel_z = sz - hero_z
+        feats = []
+        for npc in my_soldiers:
+            feats.extend(self._npc_feat(npc, hero_loc_m, ally_tower, enemy_tower))
+        for npc in enemy_soldiers:
+            feats.extend(self._npc_feat(npc, hero_loc_m, enemy_tower, ally_tower))
+        for npc in monsters:
+            feats.extend(self._npc_feat(npc, hero_loc_m, ally_tower, enemy_tower))
 
-        # 镜像翻转：PLAYERCAMP_2 出生在右上角，坐标系需要取反以对齐 PLAYERCAMP_1 视角
-        if self.transform_camp2_to_camp1:
-            rel_x = -rel_x
-            rel_z = -rel_z
+        return feats
 
-        # 归一化到 [-1, 1]，超出视野范围的 clamp 到边界
-        norm_x = max(-1.0, min(1.0, rel_x / VIEW_RANGE))
-        norm_z = max(-1.0, min(1.0, rel_z / VIEW_RANGE))
-        vector_feature.append(norm_x)
-        vector_feature.append(norm_z)
+    def _generate_organ_info_dict(self, frame_state):
+        self.main_camp_organ_dict.clear()
+        self.enemy_camp_organ_dict.clear()
+        for organ in frame_state.get("npc_states", []):
+            # 【极其重要：兼容新老协议的防御塔判定】
+            if str(organ.get("sub_type", "")) not in ("ACTOR_SUB_TOWER", "21"):
+                continue
+            if organ.get("camp") == self.main_camp:
+                self.main_camp_organ_dict["tower"] = organ
+            else:
+                self.enemy_camp_organ_dict["tower"] = organ
+
+    def _is_in_tower_range(self, abs_x: float, abs_z: float, tower: dict) -> float:
+        if not tower:
+            return 0.0
+        if abs_x == 100000 or abs_z == 100000:
+            return 0.0
+        loc = tower.get("location", {})
+        tx, tz = loc.get("x", 100000), loc.get("z", 100000)
+        if tx == 100000 or tz == 100000:
+            return 0.0
+        tx_m, tz_m = self._mirror_pos(tx, tz)
+        dx, dz = abs_x - tx_m, abs_z - tz_m
+        return 1.0 if (dx*dx + dz*dz) <= (self.tower_attack_radius ** 2) else 0.0

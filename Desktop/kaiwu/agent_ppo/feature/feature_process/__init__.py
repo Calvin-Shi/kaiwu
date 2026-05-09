@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
-###########################################################################
-"""
-Author: Tencent AI Arena Authors
-"""
-
 import math
 from agent_ppo.feature.feature_process.hero_process import HeroProcess
 from agent_ppo.feature.feature_process.organ_process import OrganProcess
-from agent_ppo.feature.feature_process.soldier_process import SoldierProcess
+# 【修改点 1】：从旧文件名中，导入新的 NpcProcess 类
+from agent_ppo.feature.feature_process.soldier_process import NpcProcess 
 
 class FeatureProcess:
     def __init__(self, camp):
         self.camp = camp
         self.hero_process = HeroProcess(camp)
         self.organ_process = OrganProcess(camp)
-        self.soldier_process = SoldierProcess(camp)
+        # 【修改点 2】：用新的引擎，替换掉旧的实例
+        self.npc_process = NpcProcess(camp)       
 
-        # 用于记录上一帧状态，计算动量平滑度
         self.last_hero_x = 0.0
         self.last_hero_z = 0.0
         self.last_dx_norm = 0.0
@@ -29,7 +23,7 @@ class FeatureProcess:
         self.camp = camp
         self.hero_process = HeroProcess(camp)
         self.organ_process = OrganProcess(camp)
-        self.soldier_process = SoldierProcess(camp)
+        self.npc_process = NpcProcess(camp)
         
         self.last_hero_x = 0.0
         self.last_hero_z = 0.0
@@ -48,18 +42,15 @@ class FeatureProcess:
     def process_feature(self, observation):
         frame_state = observation["frame_state"]
 
-        # 1. 基础特征 (19D)
         main_camp_hero_vector_feature = self.process_hero_feature(frame_state)
         organ_feature = self.process_organ_feature(frame_state)
-
-        # 2. 高阶战术特征 (10D)
         advanced_tactical_feature = self.extract_advanced_features(frame_state)
         
-        # 3. 小兵特征 (20D)
-        soldier_feature = self.process_soldier_feature(frame_state)
+        # 【修改点 3】：调用新引擎的 generate_npc_feature 方法 (输出63维)
+        npc_feature = self.npc_process.generate_npc_feature(frame_state) 
 
-        # 4. 总特征拼接 (19 + 10 + 20 = 49D)
-        feature = main_camp_hero_vector_feature + organ_feature + advanced_tactical_feature + soldier_feature
+        # 总特征拼接
+        feature = main_camp_hero_vector_feature + organ_feature + advanced_tactical_feature + npc_feature
 
         return feature
 
