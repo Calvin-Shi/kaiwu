@@ -32,6 +32,8 @@ class GameConfig:
         "hero_combo_window": 1.0,  # 【新增】英雄专属连招与状态窗口奖励
         "kill_gold_consistency": 1.0,   # 【新增】击杀与经济一致性纠偏
         "kill_tower_consistency": 1.0,  # 【新增】击杀与推塔一致性纠偏
+        "luban_passive_combo": 1.0,
+        "drj_yellow_card": 1.0,
     }
     # 动作空间宏定义
     RECALL_BUTTON_INDEX = 9  # <--- 【新增】12维离散空间中第9位为回城

@@ -73,6 +73,13 @@ class GameRewardManager:
         self._skill_prev_used = [0]*7
         self._skill_prev_hit  = [0]*7
 
+        # —— 鲁班七号：被动扫射状态追踪 ——
+        self._luban_passive_ready = False
+        self._luban_passive_ready_step = -10**9
+        
+        # —— 狄仁杰：大招黄牌状态追踪 ——
+        self._drj_s3_used_step = -10**9
+
     def init_max_exp_of_each_hero(self):
         self.m_each_level_max_exp.clear()
         self.m_each_level_max_exp[1] = 160
@@ -155,8 +162,15 @@ class GameRewardManager:
         else:
             used_delta, hit_delta = [0]*7, [0]*7
 
+        
+
         for reward_name, reward_struct in cul_calc_frame_map.items():
             reward_struct.last_frame_value = reward_struct.cur_frame_value
+
+            # 安全获取英雄ID（兼容不同的协议层级）
+            hero_config_id = 0
+            if main_hero:
+                hero_config_id = main_hero.get("config_id") or main_hero.get("hero_id") or main_hero.get("actor_state", {}).get("config_id", 0)
 
             if reward_name == "tower_hp_point":
                 if main_tower is not None and main_tower.get("max_hp", 0):
@@ -179,8 +193,22 @@ class GameRewardManager:
                 reward_struct.cur_frame_value = dead_cnt
             elif reward_name == "hero_combo_window":
                 if is_main_side:
-                    # 将 frameNo 改为 frame_no
                     inc = self.calc_hero_combo_reward(frame_data.get("frame_no", 0), main_hero, enemy_hero, used_delta, hit_delta)
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+            elif reward_name == "luban_passive_combo":
+                if is_main_side and main_hero.get("config_id") == 112: # 112是鲁班的英雄ID
+                    inc = self.luban_passive_combo_reward(frame_data.get("frame_no", 0), used_delta, hit_delta)
+                    # 累加到 cur_frame_value，这样 get_reward() 做差值时就能提取出这帧的 inc
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+
+            # 【新增：狄仁杰黄牌瞬间奖励】
+            elif reward_name == "drj_yellow_card":
+                if is_main_side and main_hero.get("config_id") == 133: # 133是狄仁杰的英雄ID
+                    inc = self.drj_yellow_card_reward(frame_data.get("frame_no", 0), used_delta, hit_delta)
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
                 else:
                     reward_struct.cur_frame_value = reward_struct.last_frame_value
@@ -342,7 +370,11 @@ class GameRewardManager:
         return int(frame_no // step_len)
 
     def _skill_events_this_frame(self, hero):
-        """核心辅助：捕捉当前这 1 帧内的技能是否刚刚按下或命中"""
+        """
+        核心：边沿检测
+        返回 used_delta[7], hit_delta[7]：各槽位本帧“新增释放/命中”的次数（>=0）
+        槽位0为被动，1/2/3为主技能。
+        """
         used_delta = [0]*7
         hit_delta  = [0]*7
         slots = (hero.get("skill_state", {}) or {}).get("slot_states", []) or []
@@ -351,7 +383,8 @@ class GameRewardManager:
             level = int(slots[i].get("level", 0) or 0)
             u = int(slots[i].get("usedTimes", 0) or 0)
             h = int(slots[i].get("hitHeroTimes", 0) or 0)
-            if level > 0:
+            # 被动(0槽位)的 level 可能是0或1，主技能必须大于0才计算
+            if level > 0 or i == 0:
                 used_delta[i] = max(0, u - self._skill_prev_used[i])
                 hit_delta[i]  = max(0, h - self._skill_prev_hit[i])
             self._skill_prev_used[i] = u
@@ -359,6 +392,58 @@ class GameRewardManager:
 
         return used_delta, hit_delta
 
+    def luban_passive_combo_reward(self, frame_no, used_delta, hit_delta):
+        """鲁班七号：技能后衔接扫射的连招奖励"""
+        inc = 0.0
+        now_step = int(frame_no // 6) # 换算为逻辑 step
+
+        # 1. 触发强化：任意主动技能（1,2,3）释放
+        if any(used_delta[1:4]) > 0:
+            # 如果上一个强化扫射没打出来就被新技能覆盖了，轻微惩罚（防止瞎滚键盘）
+            if self._luban_passive_ready:
+                inc -= 0.02 
+            self._luban_passive_ready = True
+            self._luban_passive_ready_step = now_step
+
+        # 2. 扫射命中检测（槽位 0 的 hit_delta 激增）
+        if hit_delta[0] > 0:
+            if self._luban_passive_ready:
+                # 技能后接扫射，计算延迟衰减（越快接平A越香）
+                latency = max(0, now_step - self._luban_passive_ready_step)
+                decay = math.exp(-latency / 3.0) # 延迟越久，奖励越低
+                inc += 0.8 * decay 
+                self._luban_passive_ready = False # 扫射已消耗
+            else:
+                # 靠平A第五下打出的扫射，给予基础小额奖励
+                inc += 0.3
+
+        # 3. 超时惩罚：放了技能却迟迟不打扫射（超过 5 个 step）
+        if self._luban_passive_ready and (now_step - self._luban_passive_ready_step) > 5:
+            inc -= 0.05
+            self._luban_passive_ready = False
+
+        return inc
+
+    def drj_yellow_card_reward(self, frame_no, used_delta, hit_delta):
+        """狄仁杰：大招（黄牌）高风险高回报瞬间奖励"""
+        inc = 0.0
+        now_step = int(frame_no // 6)
+
+        # 1. 释放三技能（黄牌），先给予空放成本惩罚
+        # 这一步是为了防止 AI 冷却一好就对着空气乱扔大招
+        if used_delta[3] > 0:
+            inc -= 0.4
+            self._drj_s3_used_step = now_step
+
+        # 2. 命中三技能，给予巨大补偿并产生净正收益
+        if hit_delta[3] > 0:
+            # 命中加分 2.0，抵消了之前的 0.4 惩罚，净赚 1.6
+            # 为什么分开算？因为子弹飞行有延迟，不在同一帧
+            inc += 2.0
+            
+            # 【进阶拓展思路】：记录此时的 step，可以在接下来 3 秒内，给狄仁杰的普攻附加额外系数奖励，鼓励他大中人之后上去 A。
+
+        return inc
     def calculate_forward(self, main_hero, main_tower, enemy_tower):
         """
         纯几何的推进计算：英雄越靠近敌方防御塔，返回值越大。
@@ -513,7 +598,7 @@ class GameRewardManager:
                     hit_bonus = money_delta / 100.0  # 给予强烈的瞬时正反馈
                 reward_struct.value = hit_bonus
             
-            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency"):
+            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency","luban_passive_combo", "drj_yellow_card"):
                 # 单边奖励：只看我方增量，不和敌方做差
                 reward_struct.cur_frame_value  = self.m_main_calc_frame_map[reward_name].cur_frame_value
                 reward_struct.last_frame_value = self.m_main_calc_frame_map[reward_name].last_frame_value
