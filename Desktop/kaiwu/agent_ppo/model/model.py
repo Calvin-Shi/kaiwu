@@ -5,375 +5,294 @@
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
+
+精简重构版网络 + Target 注意力机制。
+Feature(114) → FC(128) → LSTM(128→128) → Actor/Critic split
+Target head: Query-Key Attention 替换简单 Linear 头。
+Context 向量注入 Actor 特征，让 Button/Move/Skill 头感知"当前盯着谁"。
 """
 
+import math
 import torch
 import torch.nn as nn
-from torch.nn import ModuleDict
-import math
+import torch.nn.functional as F
 import numpy as np
 from typing import List
 
 from agent_ppo.conf.conf import DimConfig, Config
 
 
-def masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Log-softmax over legal actions only. mask: 1=legal, 0=illegal."""
-    logits = logits + (mask.float() - 1.0) * 1e9
-    return torch.log_softmax(logits, dim=-1)
-
+# ---------------------------------------------------------------------------
+# Action sampling utilities
+# ---------------------------------------------------------------------------
 
 def masked_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Softmax over legal actions only. mask: 1=legal, 0=illegal."""
     logits = logits + (mask.float() - 1.0) * 1e9
     return torch.softmax(logits, dim=-1)
 
 
 def masked_categorical_sample(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Sample from categorical distribution over legal actions."""
     probs = masked_softmax(logits, mask)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-# === 【高阶经验 1】：增加 gain 参数，控制不同输出层的初始分布 ===
+# ---------------------------------------------------------------------------
+# Weighted FC layer
+# ---------------------------------------------------------------------------
+
 def make_fc_layer(in_features: int, out_features: int, use_bias=True, gain=np.sqrt(2)):
-    fc_layer = nn.Linear(in_features, out_features, bias=use_bias)
-    # 使用带有 gain 的正交初始化
-    nn.init.orthogonal_(fc_layer.weight, gain=gain)
+    fc = nn.Linear(in_features, out_features, bias=use_bias)
+    nn.init.orthogonal_(fc.weight, gain=gain)
     if use_bias:
-        nn.init.zeros_(fc_layer.bias)
-    return fc_layer
+        nn.init.zeros_(fc.bias)
+    return fc
 
 
-# === 【高阶经验 4 (预留)】：实体注意力机制 ===
-# 用于后续特征工程升级时，让英雄动态"盯防"敌方英雄、残血小兵或防御塔
-class EntityAttention(nn.Module):
-    def __init__(self, hero_dim, entity_dim, embed_dim=64, num_heads=4):
-        super().__init__()
-        self.hero_mlp = make_fc_layer(hero_dim, embed_dim, gain=np.sqrt(2))
-        self.entity_mlp = make_fc_layer(entity_dim, embed_dim, gain=np.sqrt(2))
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-    def forward(self, hero_feat, entity_seq):
-        # hero_feat: [Batch, hero_dim] 
-        # entity_seq: [Batch, N, entity_dim] 
-        q = self.hero_mlp(hero_feat).unsqueeze(1) # [Batch, 1, embed_dim]
-        k = self.entity_mlp(entity_seq)           # [Batch, N, embed_dim]
-        # 注意力计算：用英雄的特征去 Query 所有小兵的特征
-        attn_out, _ = self.attn(q, k, k)
-        return attn_out.squeeze(1)                # [Batch, embed_dim]
-# === 【高阶经验 3 的究极进化】：真正的目标锁定注意力机制 ===
-class TargetAttentionHead(nn.Module):
-    def __init__(self, query_dim, entity_dim, embed_dim=64):
-        super().__init__()
-        # Query 映射：把英雄的战斗意图映射到注意力空间
-        self.query_mlp = make_fc_layer(query_dim, embed_dim, gain=np.sqrt(2))
-        # Key 映射：共享权重！把 9 个候选目标的特征映射到注意力空间
-        self.key_mlp = make_fc_layer(entity_dim, embed_dim, gain=np.sqrt(2))
-
-    def forward(self, query_feat, target_seq):
-        # query_feat: [Batch, query_dim]   -> 通常是 combat_branch 的输出 (意图)
-        # target_seq: [Batch, 9, entity_dim] -> 9个候选目标的特征序列
-        
-        q = self.query_mlp(query_feat).unsqueeze(1)    # [Batch, 1, embed_dim]
-        k = self.key_mlp(target_seq)                   # [Batch, 9, embed_dim]
-
-        # 内积计算注意力打分 (Dot-product Attention)
-        # 意图(q) 去匹配 每一个目标的特征(k)
-        # [Batch, 1, embed_dim] x [Batch, embed_dim, 9] -> [Batch, 1, 9]
-        attn_logits = torch.bmm(q, k.transpose(1, 2)).squeeze(1)
-        
-        # 缩放因子，防止梯度消失/爆炸
-        attn_logits = attn_logits / np.sqrt(k.size(-1))
-        
-        # 输出的就是 9 个目标的 logits 分数
-        return attn_logits
-
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
 
 class Model(nn.Module):
     def __init__(self):
-        super(Model, self).__init__()
-        # 特征配置参数
-        self.model_name = Config.NETWORK_NAME
-        self.data_split_shape = Config.DATA_SPLIT_SHAPE
-        self.lstm_time_steps = Config.LSTM_TIME_STEPS
-        self.lstm_unit_size = Config.LSTM_UNIT_SIZE
+        super().__init__()
+
+        # ---- config ----
+        self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE      # 128
+        self.label_size_list = Config.LABEL_SIZE_LIST      # [12, 16, 16, 16, 16, 9]
+        self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
         self.seri_vec_split_shape = Config.SERI_VEC_SPLIT_SHAPE
-        self.m_learning_rate = Config.INIT_LEARNING_RATE_START
-        self.m_var_beta = Config.BETA_START
-        self.log_epsilon = Config.LOG_EPSILON
-        self.label_size_list = Config.LABEL_SIZE_LIST
+        self.data_split_shape = Config.DATA_SPLIT_SHAPE
         self.is_reinforce_task_list = Config.IS_REINFORCE_TASK_LIST
         self.min_policy = Config.MIN_POLICY
         self.clip_param = Config.CLIP_PARAM
-        self.restore_list = []
-        self.var_beta = self.m_var_beta
-        self.learning_rate = self.m_learning_rate
-        self.target_embed_dim = Config.TARGET_EMBED_DIM
-        self.cut_points = [value[0] for value in Config.data_shapes]
-        self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
+        self.var_beta = Config.BETA_START
+        self.learning_rate = Config.INIT_LEARNING_RATE_START
+        self.lstm_time_steps = Config.LSTM_TIME_STEPS
 
-        self.feature_dim = Config.SERI_VEC_SPLIT_SHAPE[0][0]
-        self.legal_action_dim = np.sum(Config.LEGAL_ACTION_SIZE_LIST)
-        self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
+        FEAT_DIM = 144
+        HIDDEN = 128
+        ATTN_D = 32  # attention embedding dimension
 
-        # 网络维度
-        self.hero_data_len = sum(Config.data_shapes[0])
-        self.feature_dim = int(DimConfig.DIM_OF_FEATURE[0])
-        
-        # ========================================================
-        # 【高阶经验 2】：Actor 与 Critic 彻底解耦
-        # ========================================================
-        
-        # ========================================================
-        # 【注意力改造 1】：初始化 Attention 模块与维度
-        # ========================================================
-        # 基础特征：17(我方英雄) + 7(敌方防御塔) + 10(战术雷达) = 34维
-        self.base_feat_dim = 34
-        # 实体特征维度：每个小兵/蛋糕/野怪 7维
-        # [abs_x_n, abs_z_n, rel_x_n, rel_z_n, hp_rate, is_friend, is_cake_or_in_tower]
-        self.entity_dim = 7
-        self.attn_embed_dim = 64
-        
-        self.entity_attention = EntityAttention(
-            hero_dim=self.base_feat_dim, 
-            entity_dim=self.entity_dim, 
-            embed_dim=self.attn_embed_dim,
-            num_heads=4
+        # ---- 1. Feature embedding (114 → 128) ----
+        self.feature_embed = nn.Sequential(
+            make_fc_layer(FEAT_DIM, HIDDEN), nn.ReLU()
         )
 
-        # 融合后的总特征维度 = 基础34维 + Attention提取的64维 = 98维
-        self.fused_dim = self.base_feat_dim + self.attn_embed_dim
+        # ---- 2. LSTM (128 → 128) ----
+        self.lstm = nn.LSTM(HIDDEN, HIDDEN, num_layers=1, batch_first=True)
 
-        # ========================================================
-        # 【注意力改造 2】：将 Actor 和 Critic 的输入维度改为融合后的 fused_dim
-        # ========================================================
-        self.critic_backbone = nn.Sequential(
-            make_fc_layer(self.fused_dim, 256), nn.ReLU(),  # <-- 这里改为了 fused_dim
-            make_fc_layer(256, 256), nn.ReLU()
-        )
-        self.value_head = make_fc_layer(256, 1, gain=1.0)
-
+        # ---- 3. Actor shared backbone (128 → 128) ----
         self.actor_shared = nn.Sequential(
-            make_fc_layer(self.fused_dim, 256), nn.ReLU()   # <-- 这里改为了 fused_dim
+            make_fc_layer(HIDDEN, HIDDEN), nn.ReLU()
         )
 
-        # ========================================================
-        # 【高阶经验 3】：Actor 输出分支解耦 + Query-Key 目标注意力
-        # ========================================================
-        # LABEL_SIZE_LIST = [12(Button), 16(MoveX), 16(MoveZ), 16(SkillX), 16(SkillZ), 9(Target)]
-        ATTN_D = self.target_embed_dim  # 32
-
-        # --- 目标注意力：9 个候选目标的实体 → Key 嵌入层 ---
-        # 每个目标实体的原始特征维度不同，统一投影到 ATTN_D 维空间
-        self.none_target_embed = nn.Parameter(torch.zeros(1, ATTN_D))     # 目标 0: 空(可学习向量)
-        self.emy_hero_embed   = make_fc_layer(5,  ATTN_D)                # 目标 1: 敌方英雄 (5维战术特征)
-        self.self_hero_embed  = make_fc_layer(17, ATTN_D)                # 目标 2: 我方英雄 (17维)
-        self.emy_tower_embed  = make_fc_layer(7,  ATTN_D)                # 目标 3: 敌方塔 (7维organ)
-        self.emy_soldier_embed = make_fc_layer(7,  ATTN_D)               # 目标 4-7: 敌兵×4 (7维共享权重)
-        self.resource_embed   = make_fc_layer(7,  ATTN_D)                # 目标 8: 蛋糕/野怪等可拾取资源 (7维)
-
-        # Query 映射：fused_feat → ATTN_D（表达"当前全局意图"）
-        self.target_query_mlp = make_fc_layer(self.fused_dim, ATTN_D)    # [98 → 32]
-
-        # Context 融合：注意力上下文注入 Actor 共享特征后投影回原位
-        self.context_fusion = make_fc_layer(256 + ATTN_D, 256)           # [288 → 256]
-
-        # --- 动作分支头（输入 256 维不变，由 context_fusion 保证兼容） ---
-        self.button_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
-        self.head_button = make_fc_layer(128, self.label_size_list[0], gain=0.01)
-
-        self.move_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
-        self.head_move_x = make_fc_layer(128, self.label_size_list[1], gain=0.01)
-        self.head_move_z = make_fc_layer(128, self.label_size_list[2], gain=0.01)
-
-        self.combat_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
-        self.head_skill_x = make_fc_layer(128, self.label_size_list[3], gain=0.01)
-        self.head_skill_z = make_fc_layer(128, self.label_size_list[4], gain=0.01)
-
-        # 保留环境原有的 LSTM 相关接口定义 (即使 baseline lite 中未使用)
-        self.lstm = torch.nn.LSTM(
-            input_size=self.lstm_unit_size, hidden_size=self.lstm_unit_size, num_layers=1,
-            bias=True, batch_first=True, dropout=0, bidirectional=False,
+        # ---- 4. Critic (128 → 128 → 1) ----
+        self.critic_backbone = nn.Sequential(
+            make_fc_layer(HIDDEN, HIDDEN), nn.ReLU()
         )
-        self.lstm_tar_embed_mlp = make_fc_layer(self.lstm_unit_size, self.target_embed_dim)
-        self.target_embed_mlp = make_fc_layer(self.target_embed_dim, self.target_embed_dim, use_bias=False)
+        self.value_head = make_fc_layer(HIDDEN, 1, gain=1.0)
 
+        # ---- 5. Action heads (128 → label_size) ----
+        self.head_button  = make_fc_layer(HIDDEN, self.label_size_list[0], gain=0.01)
+        self.head_move_x  = make_fc_layer(HIDDEN, self.label_size_list[1], gain=0.01)
+        self.head_move_z  = make_fc_layer(HIDDEN, self.label_size_list[2], gain=0.01)
+        self.head_skill_x = make_fc_layer(HIDDEN, self.label_size_list[3], gain=0.01)
+        self.head_skill_z = make_fc_layer(HIDDEN, self.label_size_list[4], gain=0.01)
+
+        # ---- 6. Target attention: Key embeddings for 9 candidate targets ----
+        # Targets (per action space spec):
+        #   0=None  1=EnemyHero  2=Self  3-6=Soldiers×4  7=Tower  8=Monster
+        self.none_key = nn.Parameter(torch.zeros(1, ATTN_D))
+        self.emy_hero_key = make_fc_layer(32, ATTN_D)     # enemy hero: 32 dims
+        self.self_key = make_fc_layer(32, ATTN_D)          # self: 32 dims
+        self.soldier_key = make_fc_layer(7, ATTN_D)        # shared for 4 soldiers
+        self.tower_key = make_fc_layer(7, ATTN_D)          # tower: 7 dims
+        self.monster_key = make_fc_layer(7, ATTN_D)        # monster: 7 dims
+
+        # ---- 7. Query projection: LSTM output → query embedding ----
+        self.target_query = make_fc_layer(HIDDEN, ATTN_D)
+
+        # ---- 8. Context fusion: inject attention context into actor features ----
+        self.context_fusion = make_fc_layer(HIDDEN + ATTN_D, HIDDEN)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(self, data_list, inference=False, legal_action=None):
         feature_vec, lstm_hidden_init, lstm_cell_init = data_list
+        B_flat = feature_vec.shape[0]
+        H = self.lstm_hidden_dim
+        ATTN_D = 32
 
-        self.lstm_cell_output = lstm_cell_init.unsqueeze(0)
-        self.lstm_hidden_output = lstm_hidden_init.unsqueeze(0)
+        # ---- 1. Feature embedding ----
+        embed = self.feature_embed(feature_vec)          # [B_flat, 128]
 
-        # ========================================================
-        # 【注意力改造 3】：动态特征切片与 Attention 前向传播
-        # ========================================================
-        # 1. 拆分基础特征与实体特征
-        # feature_vec 形状为 [Batch, 97] (34基础 + 63实体)
-        base_feat = feature_vec[:, :self.base_feat_dim]             # [Batch, 34]
-        npc_flat = feature_vec[:, self.base_feat_dim:]              # [Batch, 63]  <--- 提取实体扁平特征
-        
-        # 2. 将扁平的 NPC 特征 Reshape 为序列 (Sequence)
-        # N=9个实体(4友兵+4敌兵+1蛋糕/野怪)，每个 entity_dim=7维
-        npc_seq = npc_flat.view(-1, 9, self.entity_dim)             # <--- 【修改】：序列长度从 4 改为 9
+        # ---- 2. LSTM step ----
+        if not inference:
+            T = self.lstm_time_steps                     # e.g. 16
+            B_real = B_flat // T
+            feat_3d = embed.reshape(B_real, T, H)       # [B, T, 128]
+            h0 = lstm_hidden_init.reshape(1, B_real, H) # [1, B, 128]
+            c0 = lstm_cell_init.reshape(1, B_real, H)   # [1, B, 128]
+            lstm_out, (hn, cn) = self.lstm(feat_3d, (h0, c0))
+            lstm_feat = lstm_out.reshape(B_flat, H)     # [B*T, 128]
+            lstm_cell_out = cn.reshape(B_real, H)       # [B, 128]
+            lstm_hidden_out = hn.reshape(B_real, H)     # [B, 128]
+        else:
+            lstm_in = embed.unsqueeze(1)                 # [B, 1, 128]
+            h0 = lstm_hidden_init.reshape(1, B_flat, H)
+            c0 = lstm_cell_init.reshape(1, B_flat, H)
+            lstm_out, (hn, cn) = self.lstm(lstm_in, (h0, c0))
+            lstm_feat = lstm_out.squeeze(1)              # [B, 128]
+            lstm_cell_out = cn.reshape(B_flat, H)
+            lstm_hidden_out = hn.reshape(B_flat, H)
 
-        # 3. 通过交叉注意力机制，提取出当前局势下“最重要的敌/我威胁与资源”
-        attn_out = self.entity_attention(base_feat, npc_seq)        # [Batch, 64]
+        # ---- 3. Actor shared ----
+        a_feat = self.actor_shared(lstm_feat)            # [B_flat, 128]
 
-        # 4. 融合特征，作为后续网络的输入
-        fused_feat = torch.cat([base_feat, attn_out], dim=1)     # [Batch, 98]
+        # ---- 4. Critic ----
+        v_feat = self.critic_backbone(lstm_feat)         # [B_flat, 128]
+        value = self.value_head(v_feat)                  # [B_flat, 1]
 
-        # --- Critic 评估分支 ---
-        v_feat = self.critic_backbone(fused_feat)                   # <-- 传入 fused_feat
-        value_result = self.value_head(v_feat)
+        # ---- 5. Target attention ----
+        # Feature layout [B_flat, 144]:
+        #   [0:32]   = Self (friendly hero, 32)
+        #   [32:64]  = Enemy hero (32)
+        #   [64:71]  = Organ (enemy tower, 7)
+        #   [71:81]  = Tactical (10)
+        #   [81:109] = Friendly soldiers (4×7)
+        #   [109:137]= Enemy soldiers (4×7)
+        #   [137:144]= Cake/resource (1×7)
 
-        # --- Actor 决策分支 ---
-        a_feat = self.actor_shared(fused_feat)                         # [Batch, 256]
+        self_feat        = feature_vec[:, 0:32]            # [B_flat, 32]
+        emy_hero_feat    = feature_vec[:, 32:64]           # [B_flat, 32]
+        emy_tower_feat   = feature_vec[:, 64:71]           # [B_flat,  7]
+        emy_soldier_feat = feature_vec[:, 109:137].reshape(B_flat, 4, 7)  # [B_flat, 4, 7]
+        resource_feat    = feature_vec[:, 137:144]         # [B_flat,  7]
 
-        # ================================================================
-        # 【目标锁定注意力】: Query-Key Attention 替换 Target MLP
-        # ================================================================
-        ATTN_D = self.target_embed_dim  # 32
-        B = feature_vec.shape[0]
+        # Build 9 key tensors → correct target order per action spec
+        none_k      = self.none_key.expand(B_flat, 1, ATTN_D)                    # [B_flat, 1, 32] Target 0
+        emy_hero_k  = self.emy_hero_key(emy_hero_feat).unsqueeze(1)               # [B_flat, 1, 32] Target 1
+        self_k      = self.self_key(self_feat).unsqueeze(1)                       # [B_flat, 1, 32] Target 2
 
-        # --- Step 1: 从 feature_vec 中切分出各候选目标的原始特征 ---
-        # feature_vec 布局 [B, 97]:
-        #    [0:17]  = Hero(我方)     [17:24] = Organ(敌方塔)
-        #    [24:34] = Tactical       [34:62] = Friendly Soldiers(4×7)
-        #    [62:90] = Enemy Soldiers [90:97] = Cake/Resource(蛋糕/野怪)
-        self_feat        = feature_vec[:, 0:17]                        # [B, 17]  目标2: 我方英雄
-        emy_hero_feat    = feature_vec[:, 24:29]                       # [B,  5]  目标1: 敌方英雄 (alive,x,z,hp,dist)
-        emy_tower_feat   = feature_vec[:, 17:24]                       # [B,  7]  目标3: 敌方防御塔
-        emy_soldier_feat = feature_vec[:, 62:90].reshape(B, 4, 7)       # [B, 4, 7] 目标4-7: 敌兵×4
-        resource_feat   = feature_vec[:, 90:97]                       # [B,  7]  目标8: 蛋糕/野怪等可拾取资源
+        # 4 soldiers share embedding weight (Target 3-6)
+        emy_soldier_k = self.soldier_key(
+            emy_soldier_feat.reshape(B_flat * 4, 7)
+        ).reshape(B_flat, 4, ATTN_D)                                              # [B_flat, 4, 32]
 
-        # --- Step 2: 各实体特征 → ATTN_D 嵌入 → [B, 1, ATTN_D] ---
-        none_key      = self.none_target_embed.expand(B, 1, ATTN_D)        # [B, 1, 32]  目标0: 空(可学习)
-        emy_hero_key  = self.emy_hero_embed(emy_hero_feat).unsqueeze(1)     # [B, 1, 32]  目标1: 敌方英雄
-        self_key      = self.self_hero_embed(self_feat).unsqueeze(1)         # [B, 1, 32]  目标2: 我方英雄
-        emy_tower_key = self.emy_tower_embed(emy_tower_feat).unsqueeze(1)    # [B, 1, 32]  目标3: 敌方塔
-        resource_key  = self.resource_embed(resource_feat).unsqueeze(1)      # [B, 1, 32]  目标8: 蛋糕/资源
+        tower_k     = self.tower_key(emy_tower_feat).unsqueeze(1)                 # [B_flat, 1, 32] Target 7
+        monster_k   = self.monster_key(resource_feat).unsqueeze(1)                # [B_flat, 1, 32] Target 8
 
-        # 4 个敌兵共享 embedding 权重: [B*4, 7] → [B*4, 32] → [B, 4, 32]
-        emy_soldier_keys = self.emy_soldier_embed(
-            emy_soldier_feat.reshape(B * 4, 7)
-        ).reshape(B, 4, ATTN_D)                                         # [B, 4, 32]  目标4-7: 敌兵×4
-
-        # --- Step 3: 拼接 9 个 Key → [B, 9, 32] ---
-        # 顺序严格对齐 label 索引: 0=None, 1=EnemyHero, 2=Self, 3=EnemyTower, 4-7=Soldiers, 8=Cake/Resource
         keys = torch.cat([
-            none_key,          # [B, 1, 32]
-            emy_hero_key,      # [B, 1, 32]
-            self_key,          # [B, 1, 32]
-            emy_tower_key,     # [B, 1, 32]
-            emy_soldier_keys,  # [B, 4, 32]
-            resource_key,      # [B, 1, 32]
-        ], dim=1)                                                       # [B, 9, 32]
+            none_k,          # Target 0: None
+            emy_hero_k,      # Target 1: Enemy hero
+            self_k,          # Target 2: Self
+            emy_soldier_k,   # Target 3-6: Soldiers ×4
+            tower_k,         # Target 7: Tower
+            monster_k,       # Target 8: Monster
+        ], dim=1)                                                                 # [B_flat, 9, 32]
 
-        # --- Step 4: 构建 Query (从 fused_feat 出发, 表达"当前全局意图") ---
-        query = self.target_query_mlp(fused_feat)                       # [B, 32]
+        # Query: LSTM output → query embedding
+        query = self.target_query(lstm_feat)                                      # [B_flat, 32]
 
-        # --- Step 5: 点积注意力打分 → Target Logits (不再经过 MLP!) ---
-        # Score = Keys @ Query^T  →  [B, 9, 1] → squeeze → [B, 9]
-        attn_scores = torch.bmm(keys, query.unsqueeze(-1)).squeeze(-1)  # [B, 9]
-        attn_logits = attn_scores / math.sqrt(ATTN_D)                   # [B, 9]  缩放防止梯度消失
-        logit_target = attn_logits                                      # [B, 9]  直接输出作为 Target logits!
+        # Dot-product attention → target logits
+        attn_logits = torch.bmm(keys, query.unsqueeze(-1)).squeeze(-1)           # [B_flat, 9]
+        attn_logits = attn_logits / math.sqrt(ATTN_D)                             # [B_flat, 9]
+        logit_target = attn_logits                                                # [B_flat, 9]
 
-        # --- Step 6: Context 向量 (softmax 权重 × Keys 的加权和) ---
-        attn_weights = torch.softmax(attn_logits, dim=-1)               # [B, 9]
-        context = torch.bmm(attn_weights.unsqueeze(1), keys).squeeze(1) # [B, 32]  注意力上下文
+        # Context vector: softmax-weighted sum of keys
+        attn_weights = torch.softmax(attn_logits, dim=-1)                         # [B_flat, 9]
+        context = torch.bmm(attn_weights.unsqueeze(1), keys).squeeze(1)           # [B_flat, 32]
 
-        # --- Step 7: Context 注入 Actor 特征 ---
-        # 将"当前盯着谁"的上下文注入 a_feat，让 Button/Move/Skill 头都能感知目标焦点
-        a_feat_aug   = torch.cat([a_feat, context], dim=1)              # [B, 256+32=288]
-        a_feat_fused = self.context_fusion(a_feat_aug)                   # [B, 256]  投影回原位，兼容各分支
+        # ---- 6. Inject context into actor features ----
+        a_feat_aug = torch.cat([a_feat, context], dim=1)                          # [B_flat, 160]
+        a_feat_fused = self.context_fusion(a_feat_aug)                            # [B_flat, 128]
 
-        # --- Step 8: 各分支头（输入均为 a_feat_fused, 维度与原始一致） ---
-        b_feat = self.button_branch(a_feat_fused)                       # [B, 128]
-        logit_button = self.head_button(b_feat)                         # [B, 12]
+        # ---- 7. Action logits (all use context-enhanced actor features) ----
+        logit_button  = self.head_button(a_feat_fused)        # [B_flat, 12]
+        logit_move_x  = self.head_move_x(a_feat_fused)        # [B_flat, 16]
+        logit_move_z  = self.head_move_z(a_feat_fused)        # [B_flat, 16]
+        logit_skill_x = self.head_skill_x(a_feat_fused)       # [B_flat, 16]
+        logit_skill_z = self.head_skill_z(a_feat_fused)       # [B_flat, 16]
 
-        m_feat = self.move_branch(a_feat_fused)                         # [B, 128]
-        logit_move_x = self.head_move_x(m_feat)                         # [B, 16]
-        logit_move_z = self.head_move_z(m_feat)                         # [B, 16]
-
-        c_feat = self.combat_branch(a_feat_fused)                       # [B, 128]
-        logit_skill_x = self.head_skill_x(c_feat)                       # [B, 16]
-        logit_skill_z = self.head_skill_z(c_feat)                       # [B, 16]
-
-        # 组装返回列表 (必须与 LABEL_SIZE_LIST 的顺序严格一致)
         result_list = [
-            logit_button,
-            logit_move_x,
-            logit_move_z,
-            logit_skill_x,
-            logit_skill_z,
-            logit_target,
-            value_result
+            logit_button, logit_move_x, logit_move_z,
+            logit_skill_x, logit_skill_z, logit_target, value,
         ]
 
-        # 下面的 Inference 推理掩码逻辑保持原样，完美兼容框架
-        if inference:
-            if legal_action is not None:
-                la_splits = torch.split(legal_action, self.legal_action_size, dim=1)
-            else:
-                la_splits = [torch.ones_like(result_list[i]) for i in range(len(self.label_size_list))]
-
-            action_list, d_action_list, prob_list, d_prob_list = [], [], [], []
-
-            for i in range(len(self.label_size_list) - 1):
-                mask = la_splits[i]
-                logit = result_list[i]
-                probs = masked_softmax(logit, mask)
-                action = masked_categorical_sample(logit, mask)
-                d_action = torch.argmax(probs, dim=-1)
-                
-                action_list.append(action)
-                d_action_list.append(d_action)
-                prob_list.append(probs)
-                d_prob_list.append(probs)
-
-            # Last head (target): mask filtered by chosen button action
-            last_logit = result_list[-2]  
-            n_button = self.label_size_list[0]
-            n_target = self.label_size_list[-1]
-
-            if legal_action is not None:
-                full_target_mask = legal_action[:, sum(self.label_size_list[:-1]):]
-                full_target_mask = full_target_mask.reshape(-1, n_button, n_target)
-
-                btn_idx = action_list[0]  
-                btn_onehot = torch.zeros(btn_idx.shape[0], n_button, device=btn_idx.device)
-                btn_onehot.scatter_(1, btn_idx.unsqueeze(1), 1.0)
-                target_mask = (full_target_mask * btn_onehot.unsqueeze(-1)).sum(dim=1)
-
-                d_btn_idx = d_action_list[0]
-                d_btn_onehot = torch.zeros(d_btn_idx.shape[0], n_button, device=d_btn_idx.device)
-                d_btn_onehot.scatter_(1, d_btn_idx.unsqueeze(1), 1.0)
-                d_target_mask = (full_target_mask * d_btn_onehot.unsqueeze(-1)).sum(dim=1)
-            else:
-                target_mask = torch.ones(feature_vec.shape[0], n_target, device=feature_vec.device)
-                d_target_mask = target_mask
-
-            target_probs = masked_softmax(last_logit, target_mask)
-            target_action = masked_categorical_sample(last_logit, target_mask)
-            d_target_probs = masked_softmax(last_logit, d_target_mask)
-            d_target_action = torch.argmax(d_target_probs, dim=-1)
-
-            action_list.append(target_action)
-            d_action_list.append(d_target_action)
-            prob_list.append(target_probs)
-            d_prob_list.append(d_target_probs)
-
-            flat_prob = torch.cat(prob_list, dim=1)
-            flat_d_prob = torch.cat(d_prob_list, dim=1)
-            logits = torch.flatten(torch.cat(result_list[:-1], 1), start_dim=1)
-            value = result_list[-1]
-
-            return [logits, value, self.lstm_cell_output, self.lstm_hidden_output,
-                    action_list, d_action_list, flat_prob, flat_d_prob]
-        else:
+        if not inference:
             return result_list
 
+        # ================================================================
+        # Inference path: masked sampling
+        # ================================================================
+        if legal_action is not None:
+            la_splits = list(torch.split(legal_action, self.legal_action_size, dim=1))
+        else:
+            la_splits = [torch.ones_like(r) for r in result_list]
+
+        action_list, d_action_list, prob_list, d_prob_list = [], [], [], []
+
+        for i in range(len(self.label_size_list) - 1):
+            mask = la_splits[i]
+            logit = result_list[i]
+            probs = masked_softmax(logit, mask)
+            action = masked_categorical_sample(logit, mask)
+            d_action = torch.argmax(probs, dim=-1)
+
+            action_list.append(action)
+            d_action_list.append(d_action)
+            prob_list.append(probs)
+            d_prob_list.append(probs)
+
+        # ---- Last head (target): mask filtered by chosen button ----
+        last_logit = result_list[-2]
+        n_button = self.label_size_list[0]
+        n_target = self.label_size_list[-1]
+
+        if legal_action is not None:
+            full_target_mask = legal_action[:, sum(self.label_size_list[:-1]):]
+            full_target_mask = full_target_mask.reshape(-1, n_button, n_target)
+
+            btn_idx = action_list[0]
+            btn_onehot = torch.zeros(btn_idx.shape[0], n_button, device=btn_idx.device)
+            btn_onehot.scatter_(1, btn_idx.unsqueeze(1), 1.0)
+            target_mask = (full_target_mask * btn_onehot.unsqueeze(-1)).sum(dim=1)
+
+            d_btn_idx = d_action_list[0]
+            d_btn_onehot = torch.zeros(d_btn_idx.shape[0], n_button, device=d_btn_idx.device)
+            d_btn_onehot.scatter_(1, d_btn_idx.unsqueeze(1), 1.0)
+            d_target_mask = (full_target_mask * d_btn_onehot.unsqueeze(-1)).sum(dim=1)
+        else:
+            target_mask = torch.ones(B_flat, n_target, device=feature_vec.device)
+            d_target_mask = target_mask
+
+        target_probs = masked_softmax(last_logit, target_mask)
+        target_action = masked_categorical_sample(last_logit, target_mask)
+        d_target_probs = masked_softmax(last_logit, d_target_mask)
+        d_target_action = torch.argmax(d_target_probs, dim=-1)
+
+        action_list.append(target_action)
+        d_action_list.append(d_target_action)
+        prob_list.append(target_probs)
+        d_prob_list.append(d_target_probs)
+
+        flat_prob = torch.cat(prob_list, dim=1)
+        flat_d_prob = torch.cat(d_prob_list, dim=1)
+        logits = torch.flatten(torch.cat(result_list[:-1], 1), start_dim=1)
+        value_out = result_list[-1]
+
+        return [
+            logits, value_out,
+            lstm_cell_out.unsqueeze(0),   # [1, B, H]
+            lstm_hidden_out.unsqueeze(0), # [1, B, H]
+            action_list, d_action_list,
+            flat_prob, flat_d_prob,
+        ]
+
+    # ------------------------------------------------------------------
+    # compute_loss
+    # ------------------------------------------------------------------
     def compute_loss(self, data_list, rst_list):
         seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])
         usq_reward = data_list[1].reshape(-1, self.data_split_shape[1])
@@ -395,18 +314,13 @@ class Model(nn.Module):
         usq_weight_list = data_list[3 + 2 * len(self.label_size_list) : 3 + 3 * len(self.label_size_list)]
         for shape_index in range(len(self.label_size_list)):
             usq_weight_list[shape_index] = usq_weight_list[shape_index].reshape(
-                -1,
-                self.data_split_shape[3 + 2 * len(self.label_size_list) + shape_index],
+                -1, self.data_split_shape[3 + 2 * len(self.label_size_list) + shape_index],
             )
 
         reward = usq_reward.squeeze(dim=1)
         advantage = usq_advantage.squeeze(dim=1)
-        label_list = []
-        for ele in usq_label_list:
-            label_list.append(ele.squeeze(dim=1))
-        weight_list = []
-        for weight in usq_weight_list:
-            weight_list.append(weight.squeeze(dim=1))
+        label_list = [ele.squeeze(dim=1) for ele in usq_label_list]
+        weight_list = [w.squeeze(dim=1) for w in usq_weight_list]
         frame_is_train = usq_is_train.squeeze(dim=1)
 
         label_result = rst_list[:-1]
@@ -414,90 +328,85 @@ class Model(nn.Module):
 
         _, split_feature_legal_action = torch.split(
             seri_vec,
-            [
-                np.prod(self.seri_vec_split_shape[0]),
-                np.prod(self.seri_vec_split_shape[1]),
-            ],
+            [np.prod(self.seri_vec_split_shape[0]), np.prod(self.seri_vec_split_shape[1])],
             dim=1,
         )
-        feature_legal_action_shape = list(self.seri_vec_split_shape[1])
-        feature_legal_action_shape.insert(0, -1)
-        feature_legal_action = split_feature_legal_action.reshape(feature_legal_action_shape)
-
+        fla_shape = list(self.seri_vec_split_shape[1])
+        fla_shape.insert(0, -1)
+        feature_legal_action = split_feature_legal_action.reshape(fla_shape)
         legal_action_flag_list = list(torch.split(feature_legal_action, self.label_size_list, dim=1))
 
-        # Value loss
-        fc2_value_result_squeezed = value_result.squeeze(dim=1)
-        new_advantage = reward - fc2_value_result_squeezed
+        # ---- Value loss ----
+        v_sq = value_result.squeeze(dim=1)
+        new_advantage = reward - v_sq
         self.value_cost = 0.5 * torch.mean(torch.square(new_advantage), dim=0)
 
+        # ---- Policy loss ----
         label_probability_list = []
         epsilon = 1e-5
-
-        # Policy loss
         self.policy_cost = torch.tensor(0.0)
+
         for task_index in range(len(self.is_reinforce_task_list)):
-            if self.is_reinforce_task_list[task_index]:
-                mask = legal_action_flag_list[task_index]
-                logit = label_result[task_index]
-                one_hot_actions = nn.functional.one_hot(
-                    label_list[task_index].long(), self.label_size_list[task_index]
-                ).float()
+            if not self.is_reinforce_task_list[task_index]:
+                continue
 
-                label_probability = masked_softmax(logit, mask)
-                label_probability = label_probability * mask + self.min_policy * mask
-                label_probability = label_probability / label_probability.sum(1, keepdim=True).clamp(min=epsilon)
-                label_probability_list.append(label_probability)
+            mask = legal_action_flag_list[task_index]
+            logit = label_result[task_index]
+            one_hot = nn.functional.one_hot(
+                label_list[task_index].long(), self.label_size_list[task_index]
+            ).float()
 
-                policy_p = (one_hot_actions * label_probability).sum(1)
-                policy_log_p = torch.log(policy_p + epsilon)
-                old_policy_p = (one_hot_actions * old_label_probability_list[task_index] + epsilon).sum(1)
-                old_policy_log_p = torch.log(old_policy_p)
-                final_log_p = policy_log_p - old_policy_log_p
-                ratio = torch.exp(final_log_p)
+            label_probability = masked_softmax(logit, mask)
+            label_probability = label_probability * mask + self.min_policy * mask
+            label_probability = label_probability / label_probability.sum(1, keepdim=True).clamp(min=epsilon)
+            label_probability_list.append(label_probability)
 
-                surr1 = ratio.clamp(0.0, 3.0) * advantage
-                surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
-                temp_policy_loss = -torch.sum(
-                    torch.minimum(surr1, surr2) * weight_list[task_index].float() * frame_is_train
-                ) / torch.maximum(
-                    torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0)
-                )
-                self.policy_cost = self.policy_cost + temp_policy_loss
+            policy_p = (one_hot * label_probability).sum(1)
+            policy_log_p = torch.log(policy_p + epsilon)
+            old_policy_p = (one_hot * old_label_probability_list[task_index] + epsilon).sum(1)
+            old_policy_log_p = torch.log(old_policy_p)
+            final_log_p = policy_log_p - old_policy_log_p
+            ratio = torch.exp(final_log_p)
 
-        # Entropy loss
+            surr1 = ratio.clamp(0.0, 3.0) * advantage
+            surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
+            temp_policy_loss = -torch.sum(
+                torch.minimum(surr1, surr2) * weight_list[task_index].float() * frame_is_train
+            ) / torch.maximum(
+                torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0)
+            )
+            self.policy_cost = self.policy_cost + temp_policy_loss
+
+        # ---- Entropy loss ----
         current_entropy_loss_index = 0
         entropy_loss_list = []
+
         for task_index in range(len(self.is_reinforce_task_list)):
-            if self.is_reinforce_task_list[task_index]:
-                prob = label_probability_list[current_entropy_loss_index]
-                mask = legal_action_flag_list[task_index]
-                temp_entropy_loss = -torch.sum(
-                    prob * mask * torch.log(prob + epsilon),
-                    dim=1,
-                )
-                temp_entropy_loss = -torch.sum(
-                    temp_entropy_loss * weight_list[task_index].float() * frame_is_train
-                ) / torch.maximum(
-                    torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0)
-                )
-                entropy_loss_list.append(temp_entropy_loss)
-                current_entropy_loss_index += 1
-            else:
+            if not self.is_reinforce_task_list[task_index]:
                 entropy_loss_list.append(torch.tensor(0.0))
+                continue
+
+            prob = label_probability_list[current_entropy_loss_index]
+            mask = legal_action_flag_list[task_index]
+            temp_entropy_loss = -torch.sum(
+                prob * mask * torch.log(prob + epsilon), dim=1,
+            )
+            temp_entropy_loss = -torch.sum(
+                temp_entropy_loss * weight_list[task_index].float() * frame_is_train
+            ) / torch.maximum(
+                torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0)
+            )
+            entropy_loss_list.append(temp_entropy_loss)
+            current_entropy_loss_index += 1
 
         self.entropy_cost = torch.tensor(0.0)
-        for entropy_element in entropy_loss_list:
-            self.entropy_cost = self.entropy_cost + entropy_element
+        for e in entropy_loss_list:
+            self.entropy_cost = self.entropy_cost + e
 
         self.entropy_cost_list = entropy_loss_list
-
         self.loss = self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
 
-        return self.loss, [
-            self.loss,
-            [self.value_cost, self.policy_cost, self.entropy_cost],
-        ]
+        return self.loss, [self.loss, [self.value_cost, self.policy_cost, self.entropy_cost]]
 
     def set_train_mode(self):
         self.lstm_time_steps = Config.LSTM_TIME_STEPS
@@ -507,13 +416,14 @@ class Model(nn.Module):
         self.lstm_time_steps = 1
         self.eval()
 
-# 保留 MLP 类以防你的其他外围脚本调用
+
+# Legacy compatibility
 class MLP(nn.Module):
     def __init__(
         self, fc_feat_dim_list: List[int], name: str,
         non_linearity: nn.Module = nn.ReLU, non_linearity_last: bool = False,
     ):
-        super(MLP, self).__init__()
+        super().__init__()
         self.fc_layers = nn.Sequential()
         for i in range(len(fc_feat_dim_list) - 1):
             fc_layer = make_fc_layer(fc_feat_dim_list[i], fc_feat_dim_list[i + 1])

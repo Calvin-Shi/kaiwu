@@ -54,7 +54,7 @@ class GameConfig:
 #   防御塔: is_alive(1) + belong_to_main_camp(1) + location_x(1) + location_z(1)
 #         + relative_location_x(1) + relative_location_z(1) + hp_rate(1) = 7
 class DimConfig:
-    DIM_OF_FEATURE = [97]
+    DIM_OF_FEATURE = [144]
 
 
 # Configuration related to model and algorithms used
@@ -62,83 +62,39 @@ class DimConfig:
 class Config:
     NETWORK_NAME = "network"
     LSTM_TIME_STEPS = 16
-    LSTM_UNIT_SIZE = 512
+    LSTM_UNIT_SIZE = 128
     DATA_SPLIT_SHAPE = [
-        97 + 85,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        12,
-        16,
-        16,
-        16,
-        16,
-        9,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        LSTM_UNIT_SIZE,
-        LSTM_UNIT_SIZE,
+        144 + 85,  # 229  feature + legal
+        1, 1, 1, 1, 1, 1, 1, 1,      # 8   reward, advantage, action[6]
+        12, 16, 16, 16, 16, 9,        # 6   old label probabilities
+        1, 1, 1, 1, 1, 1, 1,          # 7   sub_action[6], is_train
+        LSTM_UNIT_SIZE,                # lstm cell
+        LSTM_UNIT_SIZE,                # lstm hidden
     ]
-    SERI_VEC_SPLIT_SHAPE = [(97,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(144,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
     LOG_EPSILON = 1e-6
     LABEL_SIZE_LIST = [12, 16, 16, 16, 16, 9]
-    IS_REINFORCE_TASK_LIST = [
-        True,
-        True,
-        True,
-        True,
-        True,
-        True,
-    ]
+    IS_REINFORCE_TASK_LIST = [True] * 6
 
     CLIP_PARAM = 0.15
-
     MIN_POLICY = 0.00001
-
-    TARGET_EMBED_DIM = 32
 
     BETA_START = 0.025
     BETA_END = 0.001
     BETA_DECAY_STEPS = 50000
 
+    # data_shapes: per-frame sample element sizes (last 2 = lstm hidden/cell)
+    LS = LABEL_SIZE_LIST
     data_shapes = [
-        [(97 + 85) * 16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [192],
-        [256],
-        [256],
-        [256],
-        [256],
-        [144],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [16],
-        [512],
-        [512],
+        [(144 + 85) * 16],
+        [16], [16], [16], [16], [16], [16], [16], [16],
+        [LS[0] * 16], [LS[1] * 16], [LS[2] * 16], [LS[3] * 16], [LS[4] * 16], [LS[5] * 16],
+        [16], [16], [16], [16], [16], [16], [16],
+        [LSTM_UNIT_SIZE],
+        [LSTM_UNIT_SIZE],
     ]
 
     LEGAL_ACTION_SIZE_LIST = LABEL_SIZE_LIST.copy()
@@ -150,6 +106,4 @@ class Config:
     USE_GRAD_CLIP = True
     GRAD_CLIP_RANGE = 0.5
 
-    # The input dimension of samples on the learner from Reverb varies depending on the algorithm used.
-    # learner上reverb样本的输入维度, 注意不同的算法维度不一样
     SAMPLE_DIM = sum(DATA_SPLIT_SHAPE[:-2]) * LSTM_TIME_STEPS + sum(DATA_SPLIT_SHAPE[-2:])

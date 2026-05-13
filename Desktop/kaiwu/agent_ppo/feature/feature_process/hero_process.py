@@ -43,19 +43,24 @@ class HeroProcess:
         self.map_feature_to_norm = self.normalizer.parse_config(self.hero_feature_config)
         self.view_dist = 15000
 
-        # 每个英雄输出的标量特征数量，必须与 ini 配置 + 各 extraction 函数吐出的值数对齐：
+        # 每个英雄输出的标量特征数量：
         #   is_hero_alive(1) + location_x(1) + location_z(1) +
         #   hp_rate(1) + ep_rate(1) + level(1) + money(1) +
-        #   auto_attack_available(1) + skill_cooldown(5) +
+        #   auto_attack_available(1) +
+        #   skill_cooldown(5×4: cd_ratio, usable, hit_rate, use_rate_recent) +
         #   rel_to_opponent(3) + is_in_enemy_tower_range(1)
-        # = 12 + SKILL_SLOT_NUM
-        self.one_unit_feature_num = 12 + SKILL_SLOT_NUM
+        # = 8 + 5*4 + 3 + 1 = 32
+        self.one_unit_feature_num = 8 + 4 * SKILL_SLOT_NUM + 3 + 1
 
         # 缓存敌方/我方防御塔位置，用于越塔预警
         self.main_tower_pos = None
         self.enemy_tower_pos = None
 
         self.unit_buff_num = 1
+
+        # 技能使用频率 EMA 跟踪
+        self.skill_use_ema = {}
+        self.skill_last_used = {}
 
     def get_hero_config(self):
         self.config = configparser.ConfigParser()
@@ -83,11 +88,12 @@ class HeroProcess:
         self.generate_hero_info_list(frame_state)
         self._cache_tower_positions(frame_state)
 
-        # Generate hero features for our camp
-        # 生成我方阵营的英雄特征
+        # Generate hero features for both camps
+        # 生成双方阵营的英雄特征
         main_camp_hero_vector_feature = self.generate_one_type_hero_feature(self.main_camp_hero_dict, "main_camp")
+        enemy_camp_hero_vector_feature = self.generate_one_type_hero_feature(self.enemy_camp_hero_dict, "enemy_camp")
 
-        return main_camp_hero_vector_feature
+        return main_camp_hero_vector_feature + enemy_camp_hero_vector_feature
 
     def generate_hero_info_list(self, frame_state):
         self.main_camp_hero_dict.clear()
@@ -237,47 +243,64 @@ class HeroProcess:
     # ==================================================================
     def get_skill_cooldown(self, hero, vector_feature, feature_name):
         """
-        提取 5 个技能槽的冷却比例：cooldown / cooldown_max ∈ [0,1]。
-        语义：0 表示技能就绪，1 表示刚放完正处于满 CD。
-
-        兼容两种协议布局：
-        - hero["skill_state"]["slot_states"]   （常见）
-        - hero["slot_states"]                  （部分旧版）
-
-        若某个槽位缺失、cooldown_max 为 0，或解析失败，则填 0（视为就绪）。
-        无论如何，一定 append 恰好 SKILL_SLOT_NUM 个值，保证维度稳定。
+        提取 5 个技能槽的 4 维特征（每槽共 20 维）：
+          - cd_ratio:      冷却比例 cooldown / cooldown_max ∈ [0,1]
+          - usable:        技能是否可用 {0,1}
+          - hit_rate:      累计命中率 hitHeroTimes / usedTimes ∈ [0,1]
+          - use_rate_recent: 近期使用频率 EMA (指数移动平均)
         """
         slot_states = self._extract_slot_states(hero)
 
         for i in range(SKILL_SLOT_NUM):
-            value = 0.0
-            if i < len(slot_states):
-                slot = slot_states[i] or {}
-                cooldown = float(self._safe_get(slot, "cooldown", 0))
-                cooldown_max = float(self._safe_get(slot, "cooldown_max", 0))
-                if cooldown_max > 0:
-                    value = cooldown / cooldown_max
-                    value = max(0.0, min(1.0, value))
-            vector_feature.append(value)
+            if i < len(slot_states) and slot_states[i]:
+                slot = slot_states[i]
+                # 1) cd_ratio
+                cd = float(self._safe_get(slot, "cooldown", 0))
+                cd_max = float(self._safe_get(slot, "cooldown_max", 0))
+                cd_ratio = (cd / cd_max) if cd_max > 0 else 0.0
+                cd_ratio = max(0.0, min(1.0, cd_ratio))
+                vector_feature.append(cd_ratio)
+
+                # 2) usable
+                usable = float(self._safe_get(slot, "usable", 0))
+                vector_feature.append(usable)
+
+                # 3) hit_rate
+                used = int(self._safe_get(slot, "usedTimes", 0))
+                hit = int(self._safe_get(slot, "hitHeroTimes", 0))
+                hit_rate = (hit / used) if used > 0 else 0.0
+                hit_rate = max(0.0, min(1.0, hit_rate))
+                vector_feature.append(hit_rate)
+
+                # 4) use_rate_recent (EMA)
+                use_rate = self._update_use_rate_recent(i, slot, alpha=0.1)
+                vector_feature.append(use_rate)
+            else:
+                vector_feature.extend([0.0, 0.0, 0.0, 0.0])
 
     @staticmethod
     def _extract_slot_states(hero):
-        """
-        从 hero 中鲁棒地拿到技能槽列表。若找不到则返回空列表。
-        """
         if hero is None:
             return []
-        # 首选：skill_state.slot_states
         skill_state = hero.get("skill_state")
         if isinstance(skill_state, dict):
             slots = skill_state.get("slot_states")
             if isinstance(slots, list):
                 return slots
-        # 退路：hero 顶层 slot_states
         slots = hero.get("slot_states")
         if isinstance(slots, list):
             return slots
         return []
+
+    def _update_use_rate_recent(self, raw_idx, slot, alpha=0.1):
+        used_times = int(slot.get("usedTimes", 0) or 0)
+        prev_used = self.skill_last_used.get(raw_idx, used_times)
+        fired = 1.0 if used_times > prev_used else 0.0
+        ema_prev = self.skill_use_ema.get(raw_idx, 0.0)
+        ema_new = alpha * fired + (1 - alpha) * ema_prev
+        self.skill_use_ema[raw_idx] = ema_new
+        self.skill_last_used[raw_idx] = used_times
+        return ema_new
     def get_auto_attack_available(self, hero, vector_feature, feature_name):
         slot_states = self._extract_slot_states(hero)
         value = 0.0
@@ -296,9 +319,15 @@ class HeroProcess:
     # 输出维度：3（dx_norm, dz_norm, r_norm）
     # ==================================================================
     def get_rel_to_opponent(self, hero, vector_feature, feature_name):
-        # 找到唯一的敌方英雄（1v1 场景）
+        # 根据英雄阵营选择对手来源：我方→找敌方，敌方→找我方
+        hero_camp = hero.get("camp")
+        if hero_camp == self.main_camp:
+            opponent_dict = self.enemy_camp_hero_dict
+        else:
+            opponent_dict = self.main_camp_hero_dict
+
         enemy = None
-        for e in self.enemy_camp_hero_dict.values():
+        for e in opponent_dict.values():
             enemy = e
             break
 
@@ -306,7 +335,6 @@ class HeroProcess:
             vector_feature.extend([0.0, 0.0, 0.0])
             return
 
-        # 敌方已阵亡则不计算相对位置
         if self._safe_get(enemy, "hp", 0) <= 0:
             vector_feature.extend([0.0, 0.0, 0.0])
             return
@@ -318,16 +346,12 @@ class HeroProcess:
         emy_x = float(self._safe_get(emy_loc, "x", 0))
         emy_z = float(self._safe_get(emy_loc, "z", 0))
 
-        # 坐标镜像翻转到 camp1 视角：
-        #   若主阵营是 camp2，需翻转我方坐标；若敌方是 camp2，需翻转敌方坐标
         if self.transform_camp2_to_camp1:
-            # 主阵营 = camp2 → 我方需要翻转
             if my_x != 100000:
                 my_x = -my_x
             if my_z != 100000:
                 my_z = -my_z
         else:
-            # 主阵营 = camp1 → 敌方 (camp2) 需要翻转
             if emy_x != 100000:
                 emy_x = -emy_x
             if emy_z != 100000:
@@ -337,8 +361,6 @@ class HeroProcess:
         dz = emy_z - my_z
         r = math.hypot(dx, dz)
 
-        # 归一化：dx / dz 域为 [-15000, 15000]，使用 (v + 15000) / 30000 映射到 [0,1]
-        # r 的最大值约为地图对角线 ~42428，缩放到 [0,1]
         MAP_HALF = 15000.0
         MAP_DIAG = 42428.0
         dx_norm = max(0.0, min(1.0, (dx + MAP_HALF) / (MAP_HALF * 2)))
@@ -357,8 +379,14 @@ class HeroProcess:
     def get_is_in_enemy_tower_range(self, hero, vector_feature, feature_name):
         TOWER_ATK_RADIUS = 8800.0
 
-        # 敌方防御塔已被摧毁或未缓存 → 安全，输出 0
-        if self.enemy_tower_pos is None or hero is None:
+        # 根据英雄阵营选择"敌方塔"：我方→敌方塔，敌方→我方塔
+        hero_camp = hero.get("camp")
+        if hero_camp == self.main_camp:
+            target_tower = self.enemy_tower_pos
+        else:
+            target_tower = self.main_tower_pos
+
+        if target_tower is None or hero is None:
             vector_feature.append(0.0)
             return
 
@@ -366,19 +394,17 @@ class HeroProcess:
         my_x = float(self._safe_get(my_loc, "x", 0))
         my_z = float(self._safe_get(my_loc, "z", 0))
 
-        # 我方坐标翻转到 camp1 视角（与缓存塔位置坐标系一致）
         if self.transform_camp2_to_camp1:
             if my_x != 100000:
                 my_x = -my_x
             if my_z != 100000:
                 my_z = -my_z
 
-        # 英雄已阵亡（坐标为 100000 等异常值）→ 输出 0
         if abs(my_x) > 90000 or abs(my_z) > 90000:
             vector_feature.append(0.0)
             return
 
-        tower_x, tower_z = self.enemy_tower_pos
+        tower_x, tower_z = target_tower
         dist_to_tower = math.hypot(my_x - tower_x, my_z - tower_z)
 
         if dist_to_tower <= TOWER_ATK_RADIUS:

@@ -32,15 +32,13 @@ def init_calc_frame_map():
         calc_frame_map[key] = RewardStruct(weight)
         
     # =========================================================
-    # 【战术升级】：强行注入高阶微操奖励项
+    # 【战术升级】：追加 REWARD_WEIGHT_DICT 之外独立的高阶微操奖励项
+    # （已在 REWARD_WEIGHT_DICT 中的键不在此重复定义，统一由 GameConfig 管理）
     # =========================================================
     calc_frame_map["hp_trade"] = RewardStruct(3.0)  # 拉扯与白嫖奖励
     calc_frame_map["last_hit"] = RewardStruct(2.0)  # 补刀瞬时刺激
     calc_frame_map["anti_camp"] = RewardStruct(1.0) # 防发呆/站桩惩罚
     calc_frame_map["kiting"] = RewardStruct(1.0)    # 极限拉扯奖励
-    calc_frame_map["recall"] = RewardStruct(1.0)
-    calc_frame_map["cake_hunt"] = RewardStruct(2.0)   # 蛋糕/血包趋向奖励
-    calc_frame_map["cake_pickup"] = RewardStruct(5.0) # 蛋糕拾取瞬间奖励
     return calc_frame_map
 
 
@@ -93,7 +91,7 @@ class GameRewardManager:
         self._prev_main_dead_cnt = 0
 
         # 蛋糕/血包追踪状态
-        self._cake_tracking = None       # {pos, hp, id} 当前追踪的蛋糕
+        self._prev_cake_npc_id = None    # 上一帧最近蛋糕的 runtime_id
         self._prev_main_hp_abs = 0.0     # 上一帧我方绝对血量
         self._prev_main_hp_max = 1.0     # 上一帧我方最大血量
         self._cake_nearby_this_frame = False  # 本帧是否附近有蛋糕
@@ -225,7 +223,7 @@ class GameRewardManager:
 
                     # 阈值设置：如果我方人头领先 >= 1，但经济差却 <= 0（说明在无效打架漏兵线）
                     KILL_LEAD_THRESH = 1
-                    PENALTY = -0.02        # 每帧给一个小惩罚
+                    PENALTY = -0.05        # 每帧惩罚，加重以倒逼发育意识
 
                     inc = PENALTY if (kill_diff >= KILL_LEAD_THRESH and gold_diff <= 0) else 0.0
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
@@ -257,7 +255,7 @@ class GameRewardManager:
                     # 阈值设置：如果人头领先，但推塔进度 <= 1% 的微小缓冲值（说明杀完人就发呆/回城，不推线）
                     KILL_LEAD_THRESH = 1
                     BUFFER = 0.01
-                    PENALTY = -0.02
+                    PENALTY = -0.05
 
                     inc = PENALTY if (kill_diff >= KILL_LEAD_THRESH and tower_pressure_now <= BUFFER) else 0.0
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
@@ -311,9 +309,12 @@ class GameRewardManager:
             # ==========================================
             elif reward_name == "cake_hunt":
                 if is_main_side and main_hero is not None:
-                    cake_dist, cake_exists = self._find_nearest_cake(frame_data, camp)
+                    cake_dist, cake_exists, cake_id = self._find_nearest_cake(frame_data, camp)
                     self._cake_nearby_this_frame = cake_exists
                     self._cake_dist_this_frame = cake_dist
+                    # 记录蛋糕 ID 供下一帧拾取检测
+                    if cake_exists:
+                        self._prev_cake_npc_id = cake_id
                     # 趋向奖励：距离越近奖励越高，蛋糕不存在时无奖励
                     hunt_reward = 0.0
                     if cake_exists and cake_dist < 15000.0:
@@ -328,16 +329,22 @@ class GameRewardManager:
                     hp_max = float(self._safe_get(main_hero, "max_hp", 1))
                     pickup_reward = 0.0
 
-                    # 检测拾取事件：上一帧附近有蛋糕 + 血量跳增 >= 5% 最大血量
-                    HP_JUMP_THRESH = 0.05  # 5% 最大血量跳变
-                    if self._cake_nearby_this_frame and hp_max > 0:
+                    # 检测拾取事件：双重验证
+                    #   (a) 上一帧追踪的蛋糕 NPC 在本帧已消失 (hp<=0 或从 npc_states 移除)
+                    #   (b) 英雄血量跳增 >= 4% 最大血量
+                    cake_gone = self._check_cake_disappeared(frame_data, self._prev_cake_npc_id)
+                    HP_JUMP_THRESH = 0.04  # 4% 最大血量跳变（降低阈值减少漏检）
+                    hp_jump = 0.0
+                    if hp_max > 0:
                         prev_hp_rate = self._prev_main_hp_abs / max(self._prev_main_hp_max, 1.0)
                         cur_hp_rate = hp_abs / hp_max
                         hp_jump = cur_hp_rate - prev_hp_rate
-                        if hp_jump >= HP_JUMP_THRESH:
-                            # 血包通常恢复 20% 血量，按恢复比例给奖
-                            pickup_reward = hp_jump * 3.0
-                            self._cake_picked_up = True
+
+                    if cake_gone and hp_jump >= HP_JUMP_THRESH:
+                        # 双重验证通过：蛋糕确实被吃掉了
+                        pickup_reward = hp_jump * 3.0
+                        self._cake_picked_up = True
+                        self._prev_cake_npc_id = None
 
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + pickup_reward
                     self._prev_main_hp_abs = hp_abs
@@ -347,10 +354,16 @@ class GameRewardManager:
                     self._cake_nearby_this_frame = False
                     self._cake_dist_this_frame = 999999.0
 
+            elif reward_name == "last_hit":
+                if is_main_side:
+                    reward_struct.cur_frame_value = self._calc_last_hit_from_dead_action(frame_data, main_hero, enemy_hero)
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+
             else:
                 # 兼容新增的自定义键 (hp_trade等)，占位设为0即可
                 reward_struct.cur_frame_value = 0.0
-    
+
     def calc_hero_combo_reward(self, frame_no, hero, enemy, used_delta, hit_delta):
         """
         根据英雄类型，动态计算高阶连招与状态窗口奖励。
@@ -677,7 +690,7 @@ class GameRewardManager:
 
     def _find_nearest_cake(self, frame_data, camp):
         """在 npc_states 中寻找距离我方英雄最近的蛋糕/血包。
-        返回 (距离, 是否存在)。蛋糕不存在时距离为 999999.0。
+        返回 (距离, 是否存在, runtime_id)。蛋糕不存在时距离为 999999.0, id 为 None。
         """
         main_hero = None
         for hero in frame_data.get("hero_states", []):
@@ -686,7 +699,7 @@ class GameRewardManager:
                 break
 
         if main_hero is None:
-            return 999999.0, False
+            return 999999.0, False, None
 
         hero_loc = main_hero.get("location", {})
         hx = float(self._safe_get(hero_loc, "x", 0))
@@ -694,6 +707,7 @@ class GameRewardManager:
 
         min_dist = 999999.0
         found = False
+        found_id = None
 
         for npc in frame_data.get("npc_states", []):
             if npc.get("hp", 0) <= 0:
@@ -721,8 +735,58 @@ class GameRewardManager:
             if dist < min_dist:
                 min_dist = dist
                 found = True
+                found_id = npc.get("runtime_id")
 
-        return min_dist, found
+        return min_dist, found, found_id
+
+    def _check_cake_disappeared(self, frame_data, prev_cake_id):
+        """检查上一帧追踪的蛋糕 NPC 是否在本帧消失（被拾取）。
+        返回 True 表示蛋糕消失了。
+        """
+        if prev_cake_id is None:
+            return False
+        for npc in frame_data.get("npc_states", []):
+            if npc.get("runtime_id") == prev_cake_id:
+                if npc.get("hp", 0) > 0:
+                    return False  # 蛋糕还在且存活
+        # 蛋糕不在 npc_states 中，或 hp <= 0
+        return True
+
+    def _calc_last_hit_from_dead_action(self, frame_data, main_hero, enemy_hero):
+        """从 frame_action[dead_action] 精确计算补刀奖励/惩罚。
+        我方英雄杀敌方小兵 +1.2; 我方小兵/塔杀敌方小兵 -0.3 (漏刀);
+        敌方英雄杀我方小兵 -1.1 (被压制).
+        """
+        reward = 0.0
+        frame_action = frame_data.get("frame_action", {}) or {}
+        dead_actions = frame_action.get("dead_action", []) or []
+
+        main_id = main_hero.get("runtime_id") if main_hero else None
+        enemy_id = enemy_hero.get("runtime_id") if enemy_hero else None
+
+        for da in dead_actions:
+            killer = (da.get("killer") or {})
+            victim = (da.get("death") or {})
+
+            killer_id = killer.get("runtime_id")
+            killer_type = str(killer.get("sub_type", ""))
+            victim_type = str(victim.get("sub_type", ""))
+
+            # 只处理小兵死亡事件
+            if victim_type not in ("ACTOR_SUB_SOLDIER", "11"):
+                continue
+
+            if killer_id == main_id:
+                # 我方英雄补刀敌方小兵 → 正反馈
+                reward += 1.2
+            elif killer_id == enemy_id:
+                # 敌方英雄补刀我方小兵 → 惩罚
+                reward -= 1.1
+            elif killer_type in ("ACTOR_SUB_SOLDIER", "11", "ACTOR_SUB_TOWER", "21"):
+                # 小兵/防御塔击杀小兵（漏刀）→ 轻度惩罚
+                reward -= 0.3
+
+        return reward
 
     def frame_data_process(self, frame_data):
         main_camp, enemy_camp = -1, -1
@@ -806,9 +870,9 @@ class GameRewardManager:
                     # 提取 button action
                     if action[0] == GameConfig.RECALL_BUTTON_INDEX:
                         self.consecutive_recall_frames += 1
-                        # 核心修复点：要求必须连续不间断吟唱 50 帧（约几秒）才判定为真实回城意图
-                        if self.consecutive_recall_frames == 50:
-                            reward_struct.value = 1.0  # 给予一次性大额奖励
+                        # 核心修复点：要求连续吟唱 ~105 帧（~7秒 @15fps）等于完整回城吟唱时间
+                        if self.consecutive_recall_frames == 105:
+                            reward_struct.value = 1.0  # 完成完整回城吟唱，给予一次性大额奖励
                         else:
                             reward_struct.value = 0.0  # 吟唱期间（或已发过奖励后）不给分
                     else:
@@ -838,19 +902,7 @@ class GameRewardManager:
                         trade_bonus = -(enemy_hp_delta - main_hp_delta) * 0.5
                 reward_struct.value = trade_bonus
 
-            # =========================================================
-            # 【核心战术 2】：补刀/经济跃升瞬间奖励 (Last-hit Bonus)
-            # =========================================================
-            elif reward_name == "last_hit":
-                money_delta = (self.m_main_calc_frame_map["money"].cur_frame_value - 
-                               self.m_main_calc_frame_map["money"].last_frame_value)
-                hit_bonus = 0.0
-                # 自然跳钱大概在1~3，当金币单帧突增大于 15 时，必然是击杀了小兵/英雄/防御塔
-                if money_delta > 15.0:
-                    hit_bonus = money_delta / 100.0  # 给予强烈的瞬时正反馈
-                reward_struct.value = hit_bonus
-            
-            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency", "cake_hunt", "cake_pickup"):
+            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency", "cake_hunt", "cake_pickup", "last_hit"):
                 # 单边奖励：只看我方增量，不和敌方做差
                 reward_struct.cur_frame_value  = self.m_main_calc_frame_map[reward_name].cur_frame_value
                 reward_struct.last_frame_value = self.m_main_calc_frame_map[reward_name].last_frame_value
