@@ -22,6 +22,7 @@ Author: Tencent AI Arena Authors
 
 from agent_ppo.feature.feature_process.feature_normalizer import FeatureNormalizer
 import configparser
+import math
 import os
 
 
@@ -45,9 +46,14 @@ class HeroProcess:
         # 每个英雄输出的标量特征数量，必须与 ini 配置 + 各 extraction 函数吐出的值数对齐：
         #   is_hero_alive(1) + location_x(1) + location_z(1) +
         #   hp_rate(1) + ep_rate(1) + level(1) + money(1) +
-        #   skill_cooldown(SKILL_SLOT_NUM)
-        # = 7 + SKILL_SLOT_NUM
-        self.one_unit_feature_num = 8 + SKILL_SLOT_NUM
+        #   auto_attack_available(1) + skill_cooldown(5) +
+        #   rel_to_opponent(3) + is_in_enemy_tower_range(1)
+        # = 12 + SKILL_SLOT_NUM
+        self.one_unit_feature_num = 12 + SKILL_SLOT_NUM
+
+        # 缓存敌方/我方防御塔位置，用于越塔预警
+        self.main_tower_pos = None
+        self.enemy_tower_pos = None
 
         self.unit_buff_num = 1
 
@@ -75,6 +81,7 @@ class HeroProcess:
 
     def process_vec_hero(self, frame_state):
         self.generate_hero_info_list(frame_state)
+        self._cache_tower_positions(frame_state)
 
         # Generate hero features for our camp
         # 生成我方阵营的英雄特征
@@ -91,6 +98,38 @@ class HeroProcess:
                 self.main_hero_info = hero
             else:
                 self.enemy_camp_hero_dict[hero["config_id"]] = hero
+
+    def _cache_tower_positions(self, frame_state):
+        """
+        从 npc_states 中提取我方/敌方防御塔位置，并统一到 camp1 坐标系。
+        防御塔的 sub_type == 21；若塔已被摧毁（hp<=0 或坐标为 100000）则置 None。
+        """
+        self.main_tower_pos = None
+        self.enemy_tower_pos = None
+
+        for npc in frame_state.get("npc_states", []) or []:
+            if npc.get("sub_type") != 21:
+                continue
+            is_main = (npc["camp"] == self.main_camp)
+            hp = self._safe_get(npc, "hp", 0)
+
+            # 防御塔被推掉后坐标通常变为 100000，直接判定为无效
+            loc = npc.get("location", {}) or {}
+            x = self._safe_get(loc, "x", 0)
+            z = self._safe_get(loc, "z", 0)
+            if hp <= 0 or x > 90000 or z > 90000:
+                continue
+
+            # 镜像翻转：将 camp2 的坐标统一到 camp1 视角
+            if self.transform_camp2_to_camp1 != (npc["camp"] == self.main_camp):
+                x = -x
+                z = -z
+
+            pos = (float(x), float(z))
+            if is_main:
+                self.main_tower_pos = pos
+            else:
+                self.enemy_tower_pos = pos
 
     def generate_one_type_hero_feature(self, one_type_hero_info, camp):
         vector_feature = []
@@ -248,3 +287,101 @@ class HeroProcess:
             if cooldown <= 0:
                 value = 1.0 # 普攻完全就绪
         vector_feature.append(value)
+
+    # ==================================================================
+    # 拉扯特征：相对敌方英雄的位置 (dx, dz, r)，归一化到 [0,1]
+    #
+    # 作用：让 PPO 感知与对手的相对方位和距离，从而学习"极限射程拉扯"——
+    #       呆在射手最大射程边缘输出，避免过度近身被秒。
+    # 输出维度：3（dx_norm, dz_norm, r_norm）
+    # ==================================================================
+    def get_rel_to_opponent(self, hero, vector_feature, feature_name):
+        # 找到唯一的敌方英雄（1v1 场景）
+        enemy = None
+        for e in self.enemy_camp_hero_dict.values():
+            enemy = e
+            break
+
+        if enemy is None or hero is None:
+            vector_feature.extend([0.0, 0.0, 0.0])
+            return
+
+        # 敌方已阵亡则不计算相对位置
+        if self._safe_get(enemy, "hp", 0) <= 0:
+            vector_feature.extend([0.0, 0.0, 0.0])
+            return
+
+        my_loc = hero.get("location", {}) or {}
+        emy_loc = enemy.get("location", {}) or {}
+        my_x = float(self._safe_get(my_loc, "x", 0))
+        my_z = float(self._safe_get(my_loc, "z", 0))
+        emy_x = float(self._safe_get(emy_loc, "x", 0))
+        emy_z = float(self._safe_get(emy_loc, "z", 0))
+
+        # 坐标镜像翻转到 camp1 视角：
+        #   若主阵营是 camp2，需翻转我方坐标；若敌方是 camp2，需翻转敌方坐标
+        if self.transform_camp2_to_camp1:
+            # 主阵营 = camp2 → 我方需要翻转
+            if my_x != 100000:
+                my_x = -my_x
+            if my_z != 100000:
+                my_z = -my_z
+        else:
+            # 主阵营 = camp1 → 敌方 (camp2) 需要翻转
+            if emy_x != 100000:
+                emy_x = -emy_x
+            if emy_z != 100000:
+                emy_z = -emy_z
+
+        dx = emy_x - my_x
+        dz = emy_z - my_z
+        r = math.hypot(dx, dz)
+
+        # 归一化：dx / dz 域为 [-15000, 15000]，使用 (v + 15000) / 30000 映射到 [0,1]
+        # r 的最大值约为地图对角线 ~42428，缩放到 [0,1]
+        MAP_HALF = 15000.0
+        MAP_DIAG = 42428.0
+        dx_norm = max(0.0, min(1.0, (dx + MAP_HALF) / (MAP_HALF * 2)))
+        dz_norm = max(0.0, min(1.0, (dz + MAP_HALF) / (MAP_HALF * 2)))
+        r_norm = max(0.0, min(1.0, r / MAP_DIAG))
+
+        vector_feature.extend([dx_norm, dz_norm, r_norm])
+
+    # ==================================================================
+    # 防越塔特征：是否处于敌方防御塔攻击范围内
+    #
+    # 作用：新手 AI 常因追击残血或走位失误冲入敌方塔下送人头。
+    #       此特征在塔内时置 1.0，塔外置 0.0，让 PPO 学会"越塔需有把握"。
+    # 输出维度：1
+    # ==================================================================
+    def get_is_in_enemy_tower_range(self, hero, vector_feature, feature_name):
+        TOWER_ATK_RADIUS = 8800.0
+
+        # 敌方防御塔已被摧毁或未缓存 → 安全，输出 0
+        if self.enemy_tower_pos is None or hero is None:
+            vector_feature.append(0.0)
+            return
+
+        my_loc = hero.get("location", {}) or {}
+        my_x = float(self._safe_get(my_loc, "x", 0))
+        my_z = float(self._safe_get(my_loc, "z", 0))
+
+        # 我方坐标翻转到 camp1 视角（与缓存塔位置坐标系一致）
+        if self.transform_camp2_to_camp1:
+            if my_x != 100000:
+                my_x = -my_x
+            if my_z != 100000:
+                my_z = -my_z
+
+        # 英雄已阵亡（坐标为 100000 等异常值）→ 输出 0
+        if abs(my_x) > 90000 or abs(my_z) > 90000:
+            vector_feature.append(0.0)
+            return
+
+        tower_x, tower_z = self.enemy_tower_pos
+        dist_to_tower = math.hypot(my_x - tower_x, my_z - tower_z)
+
+        if dist_to_tower <= TOWER_ATK_RADIUS:
+            vector_feature.append(1.0)
+        else:
+            vector_feature.append(0.0)

@@ -27,18 +27,10 @@ from agent_ppo.algorithm.algorithm import Algorithm
 from agent_ppo.feature.feature_process import FeatureProcess
 
 
-# Available summoner skills / 可选召唤师技能
+# Available summoner skills / 可选召唤师技能 (限定闪现和狂暴)
 SUMMONER_SKILL_MAP = {
-    80102: "治疗",
-    80109: "疾跑",
-    80104: "惩击",
-    80108: "终结",
-    80110: "狂暴",
-    80105: "干扰",
-    80103: "晕眩",
-    80107: "净化",
-    80121: "弱化",
     80115: "闪现",
+    80110: "狂暴",
 }
 SUMMONER_SKILL_IDS = list(SUMMONER_SKILL_MAP.keys())
 

@@ -32,8 +32,9 @@ class GameConfig:
         "hero_combo_window": 1.0,  # 【新增】英雄专属连招与状态窗口奖励
         "kill_gold_consistency": 1.0,   # 【新增】击杀与经济一致性纠偏
         "kill_tower_consistency": 1.0,  # 【新增】击杀与推塔一致性纠偏
-        "luban_passive_combo": 1.0,
-        "drj_yellow_card": 1.0,
+        "skill5_flash": 1.0,           # 【新增】闪现边沿检测与事件关联奖励
+        "cake_hunt": 2.0,             # 【新增】蛋糕/血包趋向奖励
+        "cake_pickup": 5.0,           # 【新增】蛋糕/血包拾取瞬间奖励
     }
     # 动作空间宏定义
     RECALL_BUTTON_INDEX = 9  # <--- 【新增】12维离散空间中第9位为回城
@@ -53,7 +54,7 @@ class GameConfig:
 #   防御塔: is_alive(1) + belong_to_main_camp(1) + location_x(1) + location_z(1)
 #         + relative_location_x(1) + relative_location_z(1) + hp_rate(1) = 7
 class DimConfig:
-    DIM_OF_FEATURE = [93]
+    DIM_OF_FEATURE = [97]
 
 
 # Configuration related to model and algorithms used
@@ -63,7 +64,7 @@ class Config:
     LSTM_TIME_STEPS = 16
     LSTM_UNIT_SIZE = 512
     DATA_SPLIT_SHAPE = [
-        93 + 85,
+        97 + 85,
         1,
         1,
         1,
@@ -88,7 +89,7 @@ class Config:
         LSTM_UNIT_SIZE,
         LSTM_UNIT_SIZE,
     ]
-    SERI_VEC_SPLIT_SHAPE = [(93,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(97,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
@@ -114,7 +115,7 @@ class Config:
     BETA_DECAY_STEPS = 50000
 
     data_shapes = [
-        [(93 + 85) * 16],
+        [(97 + 85) * 16],
         [16],
         [16],
         [16],

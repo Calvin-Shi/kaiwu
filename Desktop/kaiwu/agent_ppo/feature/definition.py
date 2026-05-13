@@ -79,13 +79,8 @@ def build_frame(agent, observation):
     for hero in hero_list:
         hero_camp = hero["camp"]
         hero_hp = hero["hp"]
-        
-        # 【修复点 1】：增加唯一标识匹配（这里以 player_id 为例，具体请看你的 agent 对象属性）
-        # 确保只判断 "当前 agent 正在控制的那个英雄"
-        if hero_camp == agent.hero_camp and hero.get("player_id") == agent.player_id:
+        if hero_camp == agent.hero_camp:
             is_train = True if hero_hp > 0 else False
-            # 【修复点 2】：一旦找到当前智能体控制的英雄，更新状态后立即跳出循环
-            break
 
     if obs_data.feature is not None:
         feature_vec = np.array(obs_data.feature)
@@ -166,7 +161,7 @@ class FrameCollector:
             last_key = list(self.rl_data_map[agent_id].keys())[-1]
             last_rl_data_info = self.rl_data_map[agent_id][last_key]
             last_rl_data_info.next_value = 0
-            last_rl_data_info.reward = self._clip_reward(reward)
+            last_rl_data_info.reward = reward
 
     def sample_process(self):
         self._calc_reward()

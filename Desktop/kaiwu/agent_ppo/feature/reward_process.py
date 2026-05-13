@@ -39,6 +39,8 @@ def init_calc_frame_map():
     calc_frame_map["anti_camp"] = RewardStruct(1.0) # 防发呆/站桩惩罚
     calc_frame_map["kiting"] = RewardStruct(1.0)    # 极限拉扯奖励
     calc_frame_map["recall"] = RewardStruct(1.0)
+    calc_frame_map["cake_hunt"] = RewardStruct(2.0)   # 蛋糕/血包趋向奖励
+    calc_frame_map["cake_pickup"] = RewardStruct(5.0) # 蛋糕拾取瞬间奖励
     return calc_frame_map
 
 
@@ -65,20 +67,38 @@ class GameRewardManager:
         self.consecutive_recall_frames = 0
         self.cached_main_tower_pos = None
         self.cached_enemy_tower_pos = None
-        self._combo_active = False          
-        self._combo_end_step = -10**9       
-        self._combo_enemy_hp_prev = None    
-        self._combo_hero_pos_prev = None    
+        # 狄仁杰 S3 黄牌破甲追击窗口
+        self._dj_s3_active = False              # 窗口是否激活
+        self._dj_s3_end_step = -10**9           # 窗口结束 step
+        self._dj_s3_enemy_hp_open = None        # 窗口开启时敌方血量（跟踪峰值）
+        self._dj_s3_enemy_hp_max = 1.0          # 窗口开启时敌方最大血量
+        self._dj_s3_dmg_dealt = 0.0             # 窗口内累计伤害比例（检测是否跟进）
+        # 狄仁杰 S2 防滥用与极限反杀
+        self._dj_prev_frame_hp = -1.0           # 上一帧我方血量（检测瞬降）
+        self._dj_prev_frame_hp_max = 1.0        # 上一帧我方最大血量
+        self._dj_prev_kill_cnt = 0              # 上一帧击杀数（检测反杀）
+        self._dj_s2_used_frame = -1              # S2 最近使用的帧号（-1 = 未使用）
+        # 鲁班七号被动连招状态机（独立于狄仁杰的 _dj_* 通道）
+        self._luban_passive_ready = False           # 是否处于"强化普攻等待期"
+        self._luban_passive_open_frame = -10**9     # 窗口开启时的帧号
+        self._luban_passive_skills_used = 0         # 窗口内累计使用技能数（检测吞被动）
+        self._luban_passive_enemy_hp_open = None    # 窗口开启时敌方血量（检测扫射命中）
+        self._luban_passive_enemy_hp_max_open = 1   # 窗口开启时敌方最大血量
         # 用于记录上一帧的技能使用情况，防止增量计算报错
         self._skill_prev_used = [0]*7
         self._skill_prev_hit  = [0]*7
+        # 闪现边沿检测：记录上一帧的 CD 比例，用于检测"交闪"瞬间
+        self._prev_flash_cd_ratio = 0.0
+        self._prev_main_kill_cnt = 0
+        self._prev_main_dead_cnt = 0
 
-        # —— 鲁班七号：被动扫射状态追踪 ——
-        self._luban_passive_ready = False
-        self._luban_passive_ready_step = -10**9
-        
-        # —— 狄仁杰：大招黄牌状态追踪 ——
-        self._drj_s3_used_step = -10**9
+        # 蛋糕/血包追踪状态
+        self._cake_tracking = None       # {pos, hp, id} 当前追踪的蛋糕
+        self._prev_main_hp_abs = 0.0     # 上一帧我方绝对血量
+        self._prev_main_hp_max = 1.0     # 上一帧我方最大血量
+        self._cake_nearby_this_frame = False  # 本帧是否附近有蛋糕
+        self._cake_dist_this_frame = 999999.0 # 本帧距离最近蛋糕的距离
+        self._cake_picked_up = False     # 本帧是否拾取了蛋糕
 
     def init_max_exp_of_each_hero(self):
         self.m_each_level_max_exp.clear()
@@ -162,15 +182,8 @@ class GameRewardManager:
         else:
             used_delta, hit_delta = [0]*7, [0]*7
 
-        
-
         for reward_name, reward_struct in cul_calc_frame_map.items():
             reward_struct.last_frame_value = reward_struct.cur_frame_value
-
-            # 安全获取英雄ID（兼容不同的协议层级）
-            hero_config_id = 0
-            if main_hero:
-                hero_config_id = main_hero.get("config_id") or main_hero.get("hero_id") or main_hero.get("actor_state", {}).get("config_id", 0)
 
             if reward_name == "tower_hp_point":
                 if main_tower is not None and main_tower.get("max_hp", 0):
@@ -193,22 +206,8 @@ class GameRewardManager:
                 reward_struct.cur_frame_value = dead_cnt
             elif reward_name == "hero_combo_window":
                 if is_main_side:
+                    # 将 frameNo 改为 frame_no
                     inc = self.calc_hero_combo_reward(frame_data.get("frame_no", 0), main_hero, enemy_hero, used_delta, hit_delta)
-                    reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
-                else:
-                    reward_struct.cur_frame_value = reward_struct.last_frame_value
-            elif reward_name == "luban_passive_combo":
-                if is_main_side and main_hero.get("config_id") == 112: # 112是鲁班的英雄ID
-                    inc = self.luban_passive_combo_reward(frame_data.get("frame_no", 0), used_delta, hit_delta)
-                    # 累加到 cur_frame_value，这样 get_reward() 做差值时就能提取出这帧的 inc
-                    reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
-                else:
-                    reward_struct.cur_frame_value = reward_struct.last_frame_value
-
-            # 【新增：狄仁杰黄牌瞬间奖励】
-            elif reward_name == "drj_yellow_card":
-                if is_main_side and main_hero.get("config_id") == 133: # 133是狄仁杰的英雄ID
-                    inc = self.drj_yellow_card_reward(frame_data.get("frame_no", 0), used_delta, hit_delta)
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
                 else:
                     reward_struct.cur_frame_value = reward_struct.last_frame_value
@@ -217,16 +216,15 @@ class GameRewardManager:
             # ==========================================
             elif reward_name == "kill_gold_consistency":
                 if is_main_side:
-                    my_kills   = main_hero.get("killCnt", 0)
-                    emy_kills  = enemy_hero.get("killCnt", 0) if enemy_hero else 0
-                    my_gold    = main_hero.get("moneyCnt", 0)
-                    emy_gold   = enemy_hero.get("moneyCnt", 0) if enemy_hero else 0
+                    # 使用 pre-extracted 局部变量，避免字段名不一致导致取值恒为0
+                    emy_kills  = float(self._safe_get(enemy_hero, "kill_cnt", 0)) if enemy_hero else 0
+                    emy_gold   = float(self._safe_get(enemy_hero, "money", 0))   if enemy_hero else 0
 
-                    kill_diff  = my_kills - emy_kills
-                    gold_diff  = my_gold  - emy_gold
+                    kill_diff  = kill_cnt - emy_kills
+                    gold_diff  = money    - emy_gold
 
                     # 阈值设置：如果我方人头领先 >= 1，但经济差却 <= 0（说明在无效打架漏兵线）
-                    KILL_LEAD_THRESH = 1   
+                    KILL_LEAD_THRESH = 1
                     PENALTY = -0.02        # 每帧给一个小惩罚
 
                     inc = PENALTY if (kill_diff >= KILL_LEAD_THRESH and gold_diff <= 0) else 0.0
@@ -239,28 +237,116 @@ class GameRewardManager:
             # ==========================================
             elif reward_name == "kill_tower_consistency":
                 if is_main_side:
-                    def pct(hp, mx):
-                        return (hp / float(mx)) if mx and mx > 0 else 1.0
+                    # 安全获取防御塔血量百分比
+                    def _tower_pct(tower):
+                        if tower is None:
+                            return 1.0
+                        hp = float(self._safe_get(tower, "hp", 0))
+                        mx = float(self._safe_get(tower, "max_hp", 1))
+                        return (hp / mx) if mx > 0 else 1.0
 
-                    my_tower_pct   = pct(main_tower["hp"],  main_tower["max_hp"])  if main_tower  else 1.0
-                    emy_tower_pct  = pct(enemy_tower["hp"], enemy_tower["max_hp"]) if enemy_tower else 1.0
-                    
+                    my_tower_pct  = _tower_pct(main_tower)
+                    emy_tower_pct = _tower_pct(enemy_tower)
+
                     # 当前推塔净进展（我方塔血量百分比 - 敌方塔血量百分比）
-                    tower_pressure_now = my_tower_pct - emy_tower_pct   
+                    tower_pressure_now = my_tower_pct - emy_tower_pct
 
-                    my_kills   = main_hero.get("killCnt", 0)
-                    emy_kills  = enemy_hero.get("killCnt", 0) if enemy_hero else 0
-                    kill_diff  = my_kills - emy_kills
+                    emy_kills = float(self._safe_get(enemy_hero, "kill_cnt", 0)) if enemy_hero else 0
+                    kill_diff = kill_cnt - emy_kills
 
                     # 阈值设置：如果人头领先，但推塔进度 <= 1% 的微小缓冲值（说明杀完人就发呆/回城，不推线）
                     KILL_LEAD_THRESH = 1
-                    BUFFER = 0.01          
+                    BUFFER = 0.01
                     PENALTY = -0.02
 
                     inc = PENALTY if (kill_diff >= KILL_LEAD_THRESH and tower_pressure_now <= BUFFER) else 0.0
                     reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
                 else:
                     reward_struct.cur_frame_value = reward_struct.last_frame_value
+
+            # ==========================================
+            # 闪现边沿检测与事件关联奖励
+            # ==========================================
+            elif reward_name == "skill5_flash":
+                if is_main_side:
+                    # 提取闪现槽位 (slot_states[5]) 的 CD 比例
+                    slots = (main_hero.get("skill_state", {}) or {}).get("slot_states", []) or []
+                    flash_cd_ratio = 0.0
+                    if len(slots) > 5 and self._safe_get(slots[5], "level", 0) > 0:
+                        cd = float(self._safe_get(slots[5], "cd", 0))
+                        max_cd = float(self._safe_get(slots[5], "max_cd", 0)
+                                       or self._safe_get(slots[5], "maxCd", 1))
+                        if max_cd > 0:
+                            flash_cd_ratio = cd / max_cd
+
+                    inc = 0.0
+                    # 边沿跳变检测：CD 比例从 0 瞬间拉高到 >0.8，说明本帧刚交了闪现
+                    FLASH_EDGE_THRESH = 0.8
+                    if self._prev_flash_cd_ratio <= 0.01 and flash_cd_ratio > FLASH_EDGE_THRESH:
+                        # 基础惩罚：防止 AI 乱交闪赶路
+                        inc -= 0.07
+
+                        # 关联事件检测：同一帧内暴击/阵亡判定
+                        cur_kill = float(self._safe_get(main_hero, "kill_cnt", 0))
+                        cur_dead = float(self._safe_get(main_hero, "dead_cnt", 0))
+
+                        if cur_kill > self._prev_main_kill_cnt:
+                            # 闪现进攻成功击杀，巨额正反馈
+                            inc += 2.0
+                        if cur_dead > self._prev_main_dead_cnt:
+                            # 交闪后仍被击杀，重罚
+                            inc -= 1.0
+
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value + inc
+
+                    # 持久化本帧状态供下一帧边沿检测比对
+                    self._prev_flash_cd_ratio = flash_cd_ratio
+                    self._prev_main_kill_cnt = float(self._safe_get(main_hero, "kill_cnt", 0))
+                    self._prev_main_dead_cnt = float(self._safe_get(main_hero, "dead_cnt", 0))
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+
+            # ==========================================
+            # 蛋糕/血包检测与奖励 (Cake Hunt & Pickup)
+            # ==========================================
+            elif reward_name == "cake_hunt":
+                if is_main_side and main_hero is not None:
+                    cake_dist, cake_exists = self._find_nearest_cake(frame_data, camp)
+                    self._cake_nearby_this_frame = cake_exists
+                    self._cake_dist_this_frame = cake_dist
+                    # 趋向奖励：距离越近奖励越高，蛋糕不存在时无奖励
+                    hunt_reward = 0.0
+                    if cake_exists and cake_dist < 15000.0:
+                        hunt_reward = max(0.0, 0.03 * (1.0 - cake_dist / 15000.0))
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value + hunt_reward
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+
+            elif reward_name == "cake_pickup":
+                if is_main_side and main_hero is not None:
+                    hp_abs = float(self._safe_get(main_hero, "hp", 0))
+                    hp_max = float(self._safe_get(main_hero, "max_hp", 1))
+                    pickup_reward = 0.0
+
+                    # 检测拾取事件：上一帧附近有蛋糕 + 血量跳增 >= 5% 最大血量
+                    HP_JUMP_THRESH = 0.05  # 5% 最大血量跳变
+                    if self._cake_nearby_this_frame and hp_max > 0:
+                        prev_hp_rate = self._prev_main_hp_abs / max(self._prev_main_hp_max, 1.0)
+                        cur_hp_rate = hp_abs / hp_max
+                        hp_jump = cur_hp_rate - prev_hp_rate
+                        if hp_jump >= HP_JUMP_THRESH:
+                            # 血包通常恢复 20% 血量，按恢复比例给奖
+                            pickup_reward = hp_jump * 3.0
+                            self._cake_picked_up = True
+
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value + pickup_reward
+                    self._prev_main_hp_abs = hp_abs
+                    self._prev_main_hp_max = hp_max
+                else:
+                    reward_struct.cur_frame_value = reward_struct.last_frame_value
+                    self._cake_nearby_this_frame = False
+                    self._cake_dist_this_frame = 999999.0
+
             else:
                 # 兼容新增的自定义键 (hp_trade等)，占位设为0即可
                 reward_struct.cur_frame_value = 0.0
@@ -268,113 +354,283 @@ class GameRewardManager:
     def calc_hero_combo_reward(self, frame_no, hero, enemy, used_delta, hit_delta):
         """
         根据英雄类型，动态计算高阶连招与状态窗口奖励。
-        - 狄仁杰(133): 大招命中后进入破甲爆发窗口，空大惩罚。
-        - 鲁班(112): 放技能后进入被动扫射窗口，站桩输出给巨奖，乱动打断扫射给惩罚。
+        - 狄仁杰(133): 黄牌破甲追击 + 二技能防滥用（见 direnjie_advanced_reward）
+        - 鲁班(112): 被动扫射连招状态机（见 luban_passive_combo_reward）
         """
         inc = 0.0
-        now_step = self._step_no(frame_no)
-        
-        # 获取敌方当前血量，用于计算窗口内的爆发伤害
-        emy_hp = (enemy or {}).get("actor_state", {}).get("hp", 0)
-        emy_hp_max = (enemy or {}).get("actor_state", {}).get("max_hp", 1) or 1
-        
-        # 尝试获取英雄配置ID，判断是鲁班还是狄仁杰 (数据协议中通常在 actor_state 里面)
-        config_id = hero.get("actor_state", {}).get("config_id", 0)
+
+        # 尝试获取英雄配置ID（数据协议中 config_id 仅在 actor_state 内）
+        config_id = hero.get("actor_state", {}).get("config_id", 0) if hero else 0
 
         # ==========================================
-        # 英雄 1：狄仁杰 (133) - 大招破甲爆发流
+        # 英雄 1：狄仁杰 (133) - 黄牌破甲 + 二技能防滥用
         # ==========================================
         if config_id == 133:
-            used3 = used_delta[3] > 0
-            hit3 = hit_delta[3] > 0
-            
-            # 1. 大招事件判定
-            if used3:
-                if hit3:
-                    # 大招命中，开启 20 步（约 2.5 秒）的破甲爆发窗口
-                    self._combo_active = True
-                    self._combo_end_step = now_step + 20
-                    self._combo_enemy_hp_prev = emy_hp
-                else:
-                    # 大招空了，给一个较大的动作惩罚，教 AI 捏死大招别乱放
-                    inc -= 0.1 
-
-            # 2. 窗口内收益结算
-            if self._combo_active and now_step <= self._combo_end_step:
-                if self._combo_enemy_hp_prev is not None and emy_hp_max > 0:
-                    delta_hp = max(0, self._combo_enemy_hp_prev - emy_hp)
-                    if delta_hp > 0:
-                        dmg_pct = delta_hp / float(emy_hp_max)
-                        # 破甲期间造成的所有伤害，给予 2.0 倍权重的超额奖励！鼓励疯狂虚空平A接技能
-                        inc += 2.0 * dmg_pct
-                        
-                # 破甲期间如果接上 1、2 技能命中，额外给连招小奖
-                if hit_delta[1] > 0 or hit_delta[2] > 0:
-                    inc += 0.05
-                    
-                self._combo_enemy_hp_prev = emy_hp
-                
-            elif now_step > self._combo_end_step:
-                self._combo_active = False
+            inc += self.direnjie_advanced_reward(frame_no, hero, enemy, used_delta, hit_delta)
 
 
         # ==========================================
-        # 英雄 2：鲁班七号 (112) - 站桩被动扫射流
+        # 英雄 2：鲁班七号 (112) - 被动扫射连招状态机
         # ==========================================
         elif config_id == 112:
-            # 只要使用了1、2、3任意技能，就会触发被动扫射
-            used_any_skill = used_delta[1] > 0 or used_delta[2] > 0 or used_delta[3] > 0
-            
-            # 1. 技能释放事件
-            if used_any_skill:
-                # 开启 8 步（约 1 秒）的扫射窗口
-                self._combo_active = True
-                self._combo_end_step = now_step + 8
-                self._combo_enemy_hp_prev = emy_hp
-                # 记录开扫射时的原点位置，用于检测走位是否打断扫射
-                hero_x = hero.get("actor_state", {}).get("location", {}).get("x", 0)
-                hero_z = hero.get("actor_state", {}).get("location", {}).get("z", 0)
-                self._combo_hero_pos_prev = (hero_x, hero_z)
-
-            # 2. 窗口内收益与惩罚结算
-            if self._combo_active and now_step <= self._combo_end_step:
-                # 首先检测是否走位过度打断了被动（在王者荣耀里，移动轮盘会取消鲁班扫射）
-                curr_x = hero.get("actor_state", {}).get("location", {}).get("x", 0)
-                curr_z = hero.get("actor_state", {}).get("location", {}).get("z", 0)
-                
-                if self._combo_hero_pos_prev:
-                    dist_moved = math.dist((curr_x, curr_z), self._combo_hero_pos_prev)
-                    if dist_moved > 1500:  # 这个阈值代表轻微挪动，超过说明AI摇动了方向盘
-                        inc -= 0.05  # 惩罚打断扫射
-                        self._combo_active = False  # 窗口提前结束
-                        return inc
-                
-                # 如果乖乖站好打出了伤害
-                if self._combo_enemy_hp_prev is not None and emy_hp_max > 0:
-                    delta_hp = max(0, self._combo_enemy_hp_prev - emy_hp)
-                    if delta_hp > 0:
-                        dmg_pct = delta_hp / float(emy_hp_max)
-                        # 扫射是鲁班核心输出，打出伤害给 1.5 倍奖励
-                        inc += 1.5 * dmg_pct
-                        
-                self._combo_enemy_hp_prev = emy_hp
-
-            elif now_step > self._combo_end_step:
-                self._combo_active = False
+            inc += self.luban_passive_combo_reward(frame_no, hero, enemy, used_delta, hit_delta)
 
         return inc
-    
+
+    def direnjie_advanced_reward(self, frame_no, hero, enemy, used_delta, hit_delta):
+        """
+        狄仁杰专属高级奖励塑形（独立于鲁班的 _luban_* 通道）。
+
+        机制一：黄牌破甲追击窗口 (S3 Combo Window)
+          IDLE ──(S3 命中)──> WINDOW (30 steps) ──(窗口结束)──> 检查跟进情况
+                               │
+                               ├── 敌方掉血 → 1.5× 破甲伤害奖励（鼓励集火）
+                               └── 窗口结束 + 伤害<3% + 我方健康 → -0.1 惩罚（浪费机会）
+
+        机制二：二技能防滥用与极限反杀 (S2 Anti-Spam & Survival)
+          - S2 使用 + HP>80% + 无近期掉血 → -0.05（满血乱交保命技）
+          - S2 使用 + HP<30% → +0.5（极限保命）
+          - S2 后 30 帧内击杀敌方 → +0.5（反杀奖励）
+        """
+        inc = 0.0
+
+        if enemy is None or hero is None:
+            self._dj_s3_active = False
+            return inc
+
+        now_step = self._step_no(frame_no)
+
+        # 安全获取血量
+        emy_hp = float(self._safe_get(enemy, "hp", 0))
+        emy_hp_max = float(self._safe_get(enemy, "max_hp", 1))
+        if emy_hp_max <= 0:
+            emy_hp_max = 1.0
+        hero_hp = float(self._safe_get(hero, "hp", 0))
+        hero_hp_max = float(self._safe_get(hero, "max_hp", 1))
+        if hero_hp_max <= 0:
+            hero_hp_max = 1.0
+        hero_hp_rate = hero_hp / hero_hp_max
+
+        # 我方死亡 → 强制关闭所有窗口
+        if hero_hp <= 0:
+            self._dj_s3_active = False
+            self._dj_s2_used_frame = -1
+            return inc
+
+        # ================================================
+        # 机制 1：黄牌破甲追击窗口 (S3 Combo Window)
+        # ================================================
+        s3_used = (used_delta[3] > 0)
+        s3_hit = (hit_delta[3] > 0)
+        S3_WINDOW_STEPS = 30    # 破甲窗口时长（~5 秒 @6f/step）
+        S3_MIN_DMG_PCT = 0.03   # 窗口内累计伤害 < 3% 视为未跟进
+        S3_NO_FOLLOW_PENALTY = -0.1
+
+        # S3 空大惩罚（保留原版逻辑）
+        if s3_used and not s3_hit:
+            inc -= 0.1
+
+        # S3 命中 → 开启/刷新窗口
+        if s3_hit:
+            self._dj_s3_active = True
+            self._dj_s3_end_step = now_step + S3_WINDOW_STEPS
+            self._dj_s3_enemy_hp_open = emy_hp
+            self._dj_s3_enemy_hp_max = emy_hp_max
+            self._dj_s3_dmg_dealt = 0.0
+
+        # 窗口内收益结算
+        if self._dj_s3_active and emy_hp > 0:
+            if now_step <= self._dj_s3_end_step:
+                if self._dj_s3_enemy_hp_open is not None:
+                    # 敌方回血 → 上修基线，避免把回血后的自然血量误判为掉血
+                    if emy_hp > self._dj_s3_enemy_hp_open:
+                        self._dj_s3_enemy_hp_open = emy_hp
+
+                    hp_drop = max(0, self._dj_s3_enemy_hp_open - emy_hp)
+                    if hp_drop > 0:
+                        dmg_pct = hp_drop / self._dj_s3_enemy_hp_max
+                        self._dj_s3_dmg_dealt += dmg_pct
+                        # 破甲期间伤害 ×1.5 倍乘子 —— 趁他病要他命！
+                        inc += 1.5 * dmg_pct
+                        self._dj_s3_enemy_hp_open = emy_hp
+            else:
+                # 窗口关闭：判定 AI 是否浪费了破甲机会
+                if (self._dj_s3_dmg_dealt < S3_MIN_DMG_PCT
+                        and hero_hp_rate > 0.5
+                        and emy_hp > 0):
+                    inc += S3_NO_FOLLOW_PENALTY
+                self._dj_s3_active = False
+
+        # ================================================
+        # 机制 2：二技能防滥用与极限反杀 (S2 Anti-Spam)
+        # ================================================
+        s2_used = (used_delta[2] > 0)
+        S2_ABUSE_HP_THRESH = 0.8     # HP > 80% 视为健康
+        S2_SURVIVAL_HP_THRESH = 0.3  # HP < 30% 视为危险
+        S2_RECENT_DMG_THRESH = 0.02  # 近期掉血 < 2% 视为无承伤
+        S2_COUNTER_KILL_WINDOW = 30  # S2 后 30 帧内的击杀视为反杀
+
+        # 计算近期掉血（对比上一帧）
+        hp_drop_recent_pct = 0.0
+        if self._dj_prev_frame_hp > 0:
+            hp_drop = max(0, self._dj_prev_frame_hp - hero_hp)
+            hp_drop_recent_pct = hp_drop / self._dj_prev_frame_hp_max
+
+        if s2_used:
+            # 滥用检测：满血且无承伤 → 瞎交保命技
+            if hero_hp_rate > S2_ABUSE_HP_THRESH and hp_drop_recent_pct < S2_RECENT_DMG_THRESH:
+                inc -= 0.05
+
+            # 保命奖励：残血交二 → 正确时机
+            if hero_hp_rate < S2_SURVIVAL_HP_THRESH:
+                inc += 0.5
+
+            # 记录使用帧号，供后续反杀检测
+            self._dj_s2_used_frame = frame_no
+
+        # 反杀检测：S2 使用后的短时间内发生击杀
+        if self._dj_s2_used_frame >= 0:
+            frames_since_s2 = frame_no - self._dj_s2_used_frame
+            cur_kill = float(self._safe_get(hero, "kill_cnt", 0))
+            if cur_kill > self._dj_prev_kill_cnt:
+                if frames_since_s2 <= S2_COUNTER_KILL_WINDOW:
+                    inc += 0.5
+                self._dj_s2_used_frame = -1  # 防止同一击杀重复奖励
+            elif frames_since_s2 > S2_COUNTER_KILL_WINDOW:
+                # 超时未反杀，关闭追踪
+                self._dj_s2_used_frame = -1
+
+        # 持久化帧状态
+        self._dj_prev_frame_hp = hero_hp
+        self._dj_prev_frame_hp_max = hero_hp_max
+        self._dj_prev_kill_cnt = float(self._safe_get(hero, "kill_cnt", 0))
+
+        return inc
+
+    def luban_passive_combo_reward(self, frame_no, hero, enemy, used_delta, hit_delta):
+        """
+        鲁班七号被动连招状态机（独立于狄仁杰的 _combo_active 通道）。
+
+        状态转换：
+          IDLE ──(技能1/2/3 使用)──> WAITING ──(扫射命中)──> IDLE (发放奖励)
+                                    │
+                                    ├──(再次放技能)──> 吞被动惩罚 + 重置窗口
+                                    │
+                                    └──(超时/死亡)──> IDLE (无奖励)
+
+        关键检测手段：
+        - 窗口开启：used_delta[1|2|3] > 0
+        - 扫射命中：敌方血量显著下降（>= 3% 最大生命值）
+        - 吞被动：窗口期内再次释放技能
+        - 卡手：窗口超过 30 帧仍处于交战状态却未平A
+        """
+        inc = 0.0
+
+        if enemy is None or hero is None:
+            self._luban_passive_ready = False
+            return inc
+
+        # 安全获取血量
+        emy_hp = float(self._safe_get(enemy, "hp", 0))
+        emy_hp_max = float(self._safe_get(enemy, "max_hp", 1))
+        if emy_hp_max <= 0:
+            emy_hp_max = 1.0
+        hero_hp = float(self._safe_get(hero, "hp", 0))
+
+        # 任一方死亡 → 强制关闭窗口
+        if hero_hp <= 0 or emy_hp <= 0:
+            self._luban_passive_ready = False
+            return inc
+
+        skill_used = (used_delta[1] > 0 or used_delta[2] > 0 or used_delta[3] > 0)
+
+        # ================================================
+        # 状态 0：空闲 —— 等待技能释放以开启窗口
+        # ================================================
+        if not self._luban_passive_ready:
+            if skill_used:
+                self._luban_passive_ready = True
+                self._luban_passive_open_frame = frame_no
+                self._luban_passive_skills_used = 1
+                self._luban_passive_enemy_hp_open = emy_hp
+                self._luban_passive_enemy_hp_max_open = emy_hp_max
+            return inc
+
+        # ================================================
+        # 状态 1：等待期 —— 窗口已开启，等待扫射打出
+        # ================================================
+        frames_elapsed = frame_no - self._luban_passive_open_frame
+        MAX_WINDOW = 60      # 最大窗口帧数（~4 秒 @15fps），超过则被动自然消失
+        COMBO_WINDOW = 20    # 最佳连招窗口（打得越快奖励越高）
+        HOLD_THRESH = 30     # 卡手警告阈值
+        COMBO_DMG_THRESH = 0.03  # 敌方掉血 >= 3% max_hp 判定为扫射命中
+        SKIP_PENALTY = -0.04     # 吞被动惩罚
+        HOLD_PENALTY = -0.01     # 卡手每帧惩罚
+        COMBO_BASE = 0.5         # 连招基础奖励
+        DECAY_TAU = 10.0         # 衰减常数（帧），越小衰减越快
+
+        # ---- 超时保护 ----
+        if frames_elapsed > MAX_WINDOW:
+            self._luban_passive_ready = False
+            return inc
+
+        # ---- 检测 1：吞被动（窗口期内再次释放技能） ----
+        if skill_used:
+            inc += SKIP_PENALTY
+            self._luban_passive_skills_used += 1
+            # 重置窗口基准：新技能重新刷新了被动，以当前帧为新起点
+            self._luban_passive_open_frame = frame_no
+            self._luban_passive_enemy_hp_open = max(emy_hp, self._luban_passive_enemy_hp_open or 0)
+            self._luban_passive_enemy_hp_max_open = emy_hp_max
+
+        # ---- 辅助：若敌方回血，上修基线防止假阳性 ----
+        if emy_hp > (self._luban_passive_enemy_hp_open or 0):
+            self._luban_passive_enemy_hp_open = emy_hp
+
+        # ---- 检测 2：扫射命中（敌方血量显著下降） ----
+        hp_drop = (self._luban_passive_enemy_hp_open or 0) - emy_hp
+        hp_drop_pct = hp_drop / self._luban_passive_enemy_hp_max_open
+
+        if hp_drop_pct >= COMBO_DMG_THRESH and frames_elapsed <= COMBO_WINDOW:
+            # 连招成功！指数衰减：帧数越小奖励越高
+            combo_bonus = COMBO_BASE * math.exp(-frames_elapsed / DECAY_TAU)
+            inc += combo_bonus
+            self._luban_passive_ready = False
+            return inc
+
+        # ---- 检测 3：卡手惩罚（交战状态下长时间不A） ----
+        if frames_elapsed > HOLD_THRESH:
+            in_combat = self._luban_is_in_combat(hero, enemy)
+            if in_combat:
+                inc += HOLD_PENALTY
+
+        return inc
+
+    def _luban_is_in_combat(self, hero, enemy):
+        """判断是否处于交战状态：敌方存活且双方距离 < 15000（同屏可视范围）。"""
+        if hero is None or enemy is None:
+            return False
+        try:
+            h_loc = hero.get("location") or {}
+            e_loc = enemy.get("location") or {}
+            hx = float(self._safe_get(h_loc, "x", 0))
+            hz = float(self._safe_get(h_loc, "z", 0))
+            ex = float(self._safe_get(e_loc, "x", 0))
+            ez = float(self._safe_get(e_loc, "z", 0))
+            # 跳过死亡传回值 100000
+            if abs(hx) > 90000 or abs(hz) > 90000 or abs(ex) > 90000 or abs(ez) > 90000:
+                return False
+            return math.hypot(hx - ex, hz - ez) < 15000.0
+        except Exception:
+            return False
+
     def _step_no(self, frame_no):
         """将帧号转化为宏观决策步(step)，默认引擎1秒15帧，决策频率大概是2-3帧一次"""
-        step_len = 6 
+        step_len = 6
         return int(frame_no // step_len)
 
     def _skill_events_this_frame(self, hero):
-        """
-        核心：边沿检测
-        返回 used_delta[7], hit_delta[7]：各槽位本帧“新增释放/命中”的次数（>=0）
-        槽位0为被动，1/2/3为主技能。
-        """
+        """核心辅助：捕捉当前这 1 帧内的技能是否刚刚按下或命中"""
         used_delta = [0]*7
         hit_delta  = [0]*7
         slots = (hero.get("skill_state", {}) or {}).get("slot_states", []) or []
@@ -383,8 +639,7 @@ class GameRewardManager:
             level = int(slots[i].get("level", 0) or 0)
             u = int(slots[i].get("usedTimes", 0) or 0)
             h = int(slots[i].get("hitHeroTimes", 0) or 0)
-            # 被动(0槽位)的 level 可能是0或1，主技能必须大于0才计算
-            if level > 0 or i == 0:
+            if level > 0:
                 used_delta[i] = max(0, u - self._skill_prev_used[i])
                 hit_delta[i]  = max(0, h - self._skill_prev_hit[i])
             self._skill_prev_used[i] = u
@@ -392,58 +647,6 @@ class GameRewardManager:
 
         return used_delta, hit_delta
 
-    def luban_passive_combo_reward(self, frame_no, used_delta, hit_delta):
-        """鲁班七号：技能后衔接扫射的连招奖励"""
-        inc = 0.0
-        now_step = int(frame_no // 6) # 换算为逻辑 step
-
-        # 1. 触发强化：任意主动技能（1,2,3）释放
-        if any(used_delta[1:4]) > 0:
-            # 如果上一个强化扫射没打出来就被新技能覆盖了，轻微惩罚（防止瞎滚键盘）
-            if self._luban_passive_ready:
-                inc -= 0.02 
-            self._luban_passive_ready = True
-            self._luban_passive_ready_step = now_step
-
-        # 2. 扫射命中检测（槽位 0 的 hit_delta 激增）
-        if hit_delta[0] > 0:
-            if self._luban_passive_ready:
-                # 技能后接扫射，计算延迟衰减（越快接平A越香）
-                latency = max(0, now_step - self._luban_passive_ready_step)
-                decay = math.exp(-latency / 3.0) # 延迟越久，奖励越低
-                inc += 0.8 * decay 
-                self._luban_passive_ready = False # 扫射已消耗
-            else:
-                # 靠平A第五下打出的扫射，给予基础小额奖励
-                inc += 0.3
-
-        # 3. 超时惩罚：放了技能却迟迟不打扫射（超过 5 个 step）
-        if self._luban_passive_ready and (now_step - self._luban_passive_ready_step) > 5:
-            inc -= 0.05
-            self._luban_passive_ready = False
-
-        return inc
-
-    def drj_yellow_card_reward(self, frame_no, used_delta, hit_delta):
-        """狄仁杰：大招（黄牌）高风险高回报瞬间奖励"""
-        inc = 0.0
-        now_step = int(frame_no // 6)
-
-        # 1. 释放三技能（黄牌），先给予空放成本惩罚
-        # 这一步是为了防止 AI 冷却一好就对着空气乱扔大招
-        if used_delta[3] > 0:
-            inc -= 0.4
-            self._drj_s3_used_step = now_step
-
-        # 2. 命中三技能，给予巨大补偿并产生净正收益
-        if hit_delta[3] > 0:
-            # 命中加分 2.0，抵消了之前的 0.4 惩罚，净赚 1.6
-            # 为什么分开算？因为子弹飞行有延迟，不在同一帧
-            inc += 2.0
-            
-            # 【进阶拓展思路】：记录此时的 step，可以在接下来 3 秒内，给狄仁杰的普攻附加额外系数奖励，鼓励他大中人之后上去 A。
-
-        return inc
     def calculate_forward(self, main_hero, main_tower, enemy_tower):
         """
         纯几何的推进计算：英雄越靠近敌方防御塔，返回值越大。
@@ -471,6 +674,55 @@ class GameRewardManager:
         # 归一化的推进量
         forward_value = (dist_main2emy - dist_hero2emy) / max(dist_main2emy, 1.0)
         return forward_value
+
+    def _find_nearest_cake(self, frame_data, camp):
+        """在 npc_states 中寻找距离我方英雄最近的蛋糕/血包。
+        返回 (距离, 是否存在)。蛋糕不存在时距离为 999999.0。
+        """
+        main_hero = None
+        for hero in frame_data.get("hero_states", []):
+            if hero.get("camp") == camp:
+                main_hero = hero
+                break
+
+        if main_hero is None:
+            return 999999.0, False
+
+        hero_loc = main_hero.get("location", {})
+        hx = float(self._safe_get(hero_loc, "x", 0))
+        hz = float(self._safe_get(hero_loc, "z", 0))
+
+        min_dist = 999999.0
+        found = False
+
+        for npc in frame_data.get("npc_states", []):
+            if npc.get("hp", 0) <= 0:
+                continue
+            sub = int(npc.get("sub_type", -1) or -1)
+            at = str(npc.get("actor_type", ""))
+            # 排除小兵和防御塔
+            if sub in (11, 21) or str(sub) in ("11", "21"):
+                continue
+            if at in ("ACTOR_SUB_SOLDIER", "ACTOR_SUB_TOWER"):
+                continue
+
+            # 蛋糕特征：sub_type 在已知范围内，或 actor_type 中有 cake/organ
+            is_cake = (sub in (12, 13, 14, 22, 24, 31, 32))
+            if not is_cake:
+                at_upper = at.upper()
+                if "CAKE" not in at_upper and "ORGAN" not in at_upper and "CHERRY" not in at_upper:
+                    continue
+
+            loc = npc.get("location", {})
+            nx = float(self._safe_get(loc, "x", 0))
+            nz = float(self._safe_get(loc, "z", 0))
+            dist = math.hypot(hx - nx, hz - nz)
+
+            if dist < min_dist:
+                min_dist = dist
+                found = True
+
+        return min_dist, found
 
     def frame_data_process(self, frame_data):
         main_camp, enemy_camp = -1, -1
@@ -598,7 +850,7 @@ class GameRewardManager:
                     hit_bonus = money_delta / 100.0  # 给予强烈的瞬时正反馈
                 reward_struct.value = hit_bonus
             
-            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency","luban_passive_combo", "drj_yellow_card"):
+            elif reward_name in ("passive", "skill1", "skill2", "skill3", "skill5_flash", "hero_combo_window", "kill_gold_consistency", "kill_tower_consistency", "cake_hunt", "cake_pickup"):
                 # 单边奖励：只看我方增量，不和敌方做差
                 reward_struct.cur_frame_value  = self.m_main_calc_frame_map[reward_name].cur_frame_value
                 reward_struct.last_frame_value = self.m_main_calc_frame_map[reward_name].last_frame_value

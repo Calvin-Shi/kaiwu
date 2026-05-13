@@ -10,7 +10,7 @@ Author: Tencent AI Arena Authors
 import torch
 import torch.nn as nn
 from torch.nn import ModuleDict
-
+import math
 import numpy as np
 from typing import List
 
@@ -128,9 +128,10 @@ class Model(nn.Module):
         # ========================================================
         # 【注意力改造 1】：初始化 Attention 模块与维度
         # ========================================================
-        # 假设基础特征：12(我方) + 7(塔) + 10(战术雷达) = 29维
-        self.base_feat_dim = 30
-        # 小兵特征：每个小兵5维
+        # 基础特征：17(我方英雄) + 7(敌方防御塔) + 10(战术雷达) = 34维
+        self.base_feat_dim = 34
+        # 实体特征维度：每个小兵/蛋糕/野怪 7维
+        # [abs_x_n, abs_z_n, rel_x_n, rel_z_n, hp_rate, is_friend, is_cake_or_in_tower]
         self.entity_dim = 7
         self.attn_embed_dim = 64
         
@@ -141,47 +142,58 @@ class Model(nn.Module):
             num_heads=4
         )
 
-        # 融合后的总特征维度 = 基础29维 + Attention提取的64维 = 93维
+        # 融合后的总特征维度 = 基础34维 + Attention提取的64维 = 98维
         self.fused_dim = self.base_feat_dim + self.attn_embed_dim
 
         # ========================================================
-        # 【注意力改造 2】：将 Actor 和 Critic 的输入维度改为 LSTM 输出维度
+        # 【注意力改造 2】：将 Actor 和 Critic 的输入维度改为融合后的 fused_dim
         # ========================================================
-        # 注意：这里我们让网络真正利用上 LSTM 的时序记忆！
         self.critic_backbone = nn.Sequential(
-            make_fc_layer(self.lstm_unit_size, 256), nn.ReLU(),  # <-- 改为 lstm_unit_size (512)
+            make_fc_layer(self.fused_dim, 256), nn.ReLU(),  # <-- 这里改为了 fused_dim
             make_fc_layer(256, 256), nn.ReLU()
         )
         self.value_head = make_fc_layer(256, 1, gain=1.0)
 
         self.actor_shared = nn.Sequential(
-            make_fc_layer(self.lstm_unit_size, 256), nn.ReLU()   # <-- 改为 lstm_unit_size (512)
+            make_fc_layer(self.fused_dim, 256), nn.ReLU()   # <-- 这里改为了 fused_dim
         )
 
-        # 3.1 决策分支 (选择按哪个键)
+        # ========================================================
+        # 【高阶经验 3】：Actor 输出分支解耦 + Query-Key 目标注意力
+        # ========================================================
+        # LABEL_SIZE_LIST = [12(Button), 16(MoveX), 16(MoveZ), 16(SkillX), 16(SkillZ), 9(Target)]
+        ATTN_D = self.target_embed_dim  # 32
+
+        # --- 目标注意力：9 个候选目标的实体 → Key 嵌入层 ---
+        # 每个目标实体的原始特征维度不同，统一投影到 ATTN_D 维空间
+        self.none_target_embed = nn.Parameter(torch.zeros(1, ATTN_D))     # 目标 0: 空(可学习向量)
+        self.emy_hero_embed   = make_fc_layer(5,  ATTN_D)                # 目标 1: 敌方英雄 (5维战术特征)
+        self.self_hero_embed  = make_fc_layer(17, ATTN_D)                # 目标 2: 我方英雄 (17维)
+        self.emy_tower_embed  = make_fc_layer(7,  ATTN_D)                # 目标 3: 敌方塔 (7维organ)
+        self.emy_soldier_embed = make_fc_layer(7,  ATTN_D)               # 目标 4-7: 敌兵×4 (7维共享权重)
+        self.resource_embed   = make_fc_layer(7,  ATTN_D)                # 目标 8: 蛋糕/野怪等可拾取资源 (7维)
+
+        # Query 映射：fused_feat → ATTN_D（表达"当前全局意图"）
+        self.target_query_mlp = make_fc_layer(self.fused_dim, ATTN_D)    # [98 → 32]
+
+        # Context 融合：注意力上下文注入 Actor 共享特征后投影回原位
+        self.context_fusion = make_fc_layer(256 + ATTN_D, 256)           # [288 → 256]
+
+        # --- 动作分支头（输入 256 维不变，由 context_fusion 保证兼容） ---
         self.button_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
         self.head_button = make_fc_layer(128, self.label_size_list[0], gain=0.01)
 
-        # 3.2 走位分支 (Move X, Move Z) -> 负责连续的拉扯
         self.move_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
         self.head_move_x = make_fc_layer(128, self.label_size_list[1], gain=0.01)
         self.head_move_z = make_fc_layer(128, self.label_size_list[2], gain=0.01)
 
-        # 3.3 战斗与施法分支 (Skill X, Skill Z, Target)
         self.combat_branch = nn.Sequential(make_fc_layer(256, 128), nn.ReLU())
         self.head_skill_x = make_fc_layer(128, self.label_size_list[3], gain=0.01)
         self.head_skill_z = make_fc_layer(128, self.label_size_list[4], gain=0.01)
-        
-        # 【究极进化】：Target Attention 的 Query 维度改为 LSTM 输出维度！
-        self.target_attention = TargetAttentionHead(
-            query_dim=self.lstm_unit_size,   # <--- 直接使用 LSTM 记忆作为 Query！
-            entity_dim=self.entity_dim,      # 实体特征维度 (7维)
-            embed_dim=64
-        )
 
-        # 修复 LSTM 定义：输入维度应该是融合后的特征维度 94 (30维基础 + 64维Entity Attention)
+        # 保留环境原有的 LSTM 相关接口定义 (即使 baseline lite 中未使用)
         self.lstm = torch.nn.LSTM(
-            input_size=self.fused_dim, hidden_size=self.lstm_unit_size, num_layers=1,
+            input_size=self.lstm_unit_size, hidden_size=self.lstm_unit_size, num_layers=1,
             bias=True, batch_first=True, dropout=0, bidirectional=False,
         )
         self.lstm_tar_embed_mlp = make_fc_layer(self.lstm_unit_size, self.target_embed_dim)
@@ -190,66 +202,103 @@ class Model(nn.Module):
     def forward(self, data_list, inference=False, legal_action=None):
         feature_vec, lstm_hidden_init, lstm_cell_init = data_list
 
+        self.lstm_cell_output = lstm_cell_init.unsqueeze(0)
+        self.lstm_hidden_output = lstm_hidden_init.unsqueeze(0)
+
         # ========================================================
         # 【注意力改造 3】：动态特征切片与 Attention 前向传播
         # ========================================================
         # 1. 拆分基础特征与实体特征
-        base_feat = feature_vec[:, :self.base_feat_dim]             # [Batch*T, 30]
-        npc_flat = feature_vec[:, self.base_feat_dim:]              # [Batch*T, 63]
+        # feature_vec 形状为 [Batch, 97] (34基础 + 63实体)
+        base_feat = feature_vec[:, :self.base_feat_dim]             # [Batch, 34]
+        npc_flat = feature_vec[:, self.base_feat_dim:]              # [Batch, 63]  <--- 提取实体扁平特征
         
-        npc_seq = npc_flat.view(-1, 9, self.entity_dim)             # [Batch*T, 9, 7]
+        # 2. 将扁平的 NPC 特征 Reshape 为序列 (Sequence)
+        # N=9个实体(4友兵+4敌兵+1蛋糕/野怪)，每个 entity_dim=7维
+        npc_seq = npc_flat.view(-1, 9, self.entity_dim)             # <--- 【修改】：序列长度从 4 改为 9
 
-        # 2. 提取注意力融合特征
-        attn_out = self.entity_attention(base_feat, npc_seq)        # [Batch*T, 64]
-        fused_feat = torch.cat([base_feat, attn_out], dim=1)        # [Batch*T, 94]
+        # 3. 通过交叉注意力机制，提取出当前局势下“最重要的敌/我威胁与资源”
+        attn_out = self.entity_attention(base_feat, npc_seq)        # [Batch, 64]
 
-        # ========================================================
-        # 【修复与升级】：彻底激活 LSTM 时序网络！
-        # ========================================================
-        N = fused_feat.size(0)
-        T = self.lstm_time_steps
-        B = N // T
-        
-        # 将展平的帧序列 reshape 成 LSTM 需要的 (Batch, Time, Dim)
-        fused_seq = fused_feat.view(B, T, -1)
-        
-        h0 = lstm_hidden_init.unsqueeze(0) # [1, B, H]
-        c0 = lstm_cell_init.unsqueeze(0)   # [1, B, H]
-        
-        # 通过 LSTM，获取具有时序记忆的特征
-        lstm_out, (h_n, c_n) = self.lstm(fused_seq, (h0, c0))
-        
-        # 必须正确保存隐藏状态，供下一步推理时使用！(修复了你原本代码直接返回 init 状态的 bug)
-        self.lstm_hidden_output = h_n  
-        self.lstm_cell_output = c_n
-        
-        # 展平 LSTM 输出，交给全连接层 [Batch*T, 512]
-        lstm_out_flat = lstm_out.contiguous().view(N, -1)  
+        # 4. 融合特征，作为后续网络的输入
+        fused_feat = torch.cat([base_feat, attn_out], dim=1)     # [Batch, 98]
 
         # --- Critic 评估分支 ---
-        v_feat = self.critic_backbone(lstm_out_flat)       # <-- 传入 LSTM 记忆
+        v_feat = self.critic_backbone(fused_feat)                   # <-- 传入 fused_feat
         value_result = self.value_head(v_feat)
 
         # --- Actor 决策分支 ---
-        a_feat = self.actor_shared(lstm_out_flat)          # <-- 传入 LSTM 记忆
+        a_feat = self.actor_shared(fused_feat)                         # [Batch, 256]
 
-        # 决策
-        b_feat = self.button_branch(a_feat)
-        logit_button = self.head_button(b_feat)
+        # ================================================================
+        # 【目标锁定注意力】: Query-Key Attention 替换 Target MLP
+        # ================================================================
+        ATTN_D = self.target_embed_dim  # 32
+        B = feature_vec.shape[0]
 
-        # 走位
-        m_feat = self.move_branch(a_feat)
-        logit_move_x = self.head_move_x(m_feat)
-        logit_move_z = self.head_move_z(m_feat)
+        # --- Step 1: 从 feature_vec 中切分出各候选目标的原始特征 ---
+        # feature_vec 布局 [B, 97]:
+        #    [0:17]  = Hero(我方)     [17:24] = Organ(敌方塔)
+        #    [24:34] = Tactical       [34:62] = Friendly Soldiers(4×7)
+        #    [62:90] = Enemy Soldiers [90:97] = Cake/Resource(蛋糕/野怪)
+        self_feat        = feature_vec[:, 0:17]                        # [B, 17]  目标2: 我方英雄
+        emy_hero_feat    = feature_vec[:, 24:29]                       # [B,  5]  目标1: 敌方英雄 (alive,x,z,hp,dist)
+        emy_tower_feat   = feature_vec[:, 17:24]                       # [B,  7]  目标3: 敌方防御塔
+        emy_soldier_feat = feature_vec[:, 62:90].reshape(B, 4, 7)       # [B, 4, 7] 目标4-7: 敌兵×4
+        resource_feat   = feature_vec[:, 90:97]                       # [B,  7]  目标8: 蛋糕/野怪等可拾取资源
 
-        # 战斗
-        c_feat = self.combat_branch(a_feat)
-        logit_skill_x = self.head_skill_x(c_feat)
-        logit_skill_z = self.head_skill_z(c_feat)
-        
-        # 【神级走A与锁敌】：用 LSTM 的输出 (lstm_out_flat) 直接作为 Target Attention 的 Query！
-        # 你的射手 AI 现在能根据上一秒敌人的移动轨迹，以及刚被打掉的血量，稳健地锁定同一个目标。
-        logit_target = self.target_attention(lstm_out_flat, npc_seq)
+        # --- Step 2: 各实体特征 → ATTN_D 嵌入 → [B, 1, ATTN_D] ---
+        none_key      = self.none_target_embed.expand(B, 1, ATTN_D)        # [B, 1, 32]  目标0: 空(可学习)
+        emy_hero_key  = self.emy_hero_embed(emy_hero_feat).unsqueeze(1)     # [B, 1, 32]  目标1: 敌方英雄
+        self_key      = self.self_hero_embed(self_feat).unsqueeze(1)         # [B, 1, 32]  目标2: 我方英雄
+        emy_tower_key = self.emy_tower_embed(emy_tower_feat).unsqueeze(1)    # [B, 1, 32]  目标3: 敌方塔
+        resource_key  = self.resource_embed(resource_feat).unsqueeze(1)      # [B, 1, 32]  目标8: 蛋糕/资源
+
+        # 4 个敌兵共享 embedding 权重: [B*4, 7] → [B*4, 32] → [B, 4, 32]
+        emy_soldier_keys = self.emy_soldier_embed(
+            emy_soldier_feat.reshape(B * 4, 7)
+        ).reshape(B, 4, ATTN_D)                                         # [B, 4, 32]  目标4-7: 敌兵×4
+
+        # --- Step 3: 拼接 9 个 Key → [B, 9, 32] ---
+        # 顺序严格对齐 label 索引: 0=None, 1=EnemyHero, 2=Self, 3=EnemyTower, 4-7=Soldiers, 8=Cake/Resource
+        keys = torch.cat([
+            none_key,          # [B, 1, 32]
+            emy_hero_key,      # [B, 1, 32]
+            self_key,          # [B, 1, 32]
+            emy_tower_key,     # [B, 1, 32]
+            emy_soldier_keys,  # [B, 4, 32]
+            resource_key,      # [B, 1, 32]
+        ], dim=1)                                                       # [B, 9, 32]
+
+        # --- Step 4: 构建 Query (从 fused_feat 出发, 表达"当前全局意图") ---
+        query = self.target_query_mlp(fused_feat)                       # [B, 32]
+
+        # --- Step 5: 点积注意力打分 → Target Logits (不再经过 MLP!) ---
+        # Score = Keys @ Query^T  →  [B, 9, 1] → squeeze → [B, 9]
+        attn_scores = torch.bmm(keys, query.unsqueeze(-1)).squeeze(-1)  # [B, 9]
+        attn_logits = attn_scores / math.sqrt(ATTN_D)                   # [B, 9]  缩放防止梯度消失
+        logit_target = attn_logits                                      # [B, 9]  直接输出作为 Target logits!
+
+        # --- Step 6: Context 向量 (softmax 权重 × Keys 的加权和) ---
+        attn_weights = torch.softmax(attn_logits, dim=-1)               # [B, 9]
+        context = torch.bmm(attn_weights.unsqueeze(1), keys).squeeze(1) # [B, 32]  注意力上下文
+
+        # --- Step 7: Context 注入 Actor 特征 ---
+        # 将"当前盯着谁"的上下文注入 a_feat，让 Button/Move/Skill 头都能感知目标焦点
+        a_feat_aug   = torch.cat([a_feat, context], dim=1)              # [B, 256+32=288]
+        a_feat_fused = self.context_fusion(a_feat_aug)                   # [B, 256]  投影回原位，兼容各分支
+
+        # --- Step 8: 各分支头（输入均为 a_feat_fused, 维度与原始一致） ---
+        b_feat = self.button_branch(a_feat_fused)                       # [B, 128]
+        logit_button = self.head_button(b_feat)                         # [B, 12]
+
+        m_feat = self.move_branch(a_feat_fused)                         # [B, 128]
+        logit_move_x = self.head_move_x(m_feat)                         # [B, 16]
+        logit_move_z = self.head_move_z(m_feat)                         # [B, 16]
+
+        c_feat = self.combat_branch(a_feat_fused)                       # [B, 128]
+        logit_skill_x = self.head_skill_x(c_feat)                       # [B, 16]
+        logit_skill_z = self.head_skill_z(c_feat)                       # [B, 16]
 
         # 组装返回列表 (必须与 LABEL_SIZE_LIST 的顺序严格一致)
         result_list = [
