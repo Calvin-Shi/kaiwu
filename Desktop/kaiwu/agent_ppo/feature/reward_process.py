@@ -63,6 +63,8 @@ class GameRewardManager:
         self.pos_window = []
         # <--- 【新增】用于防刷分的连续回城帧计数器
         self.consecutive_recall_frames = 0
+        # P0/P1: 追踪上一帧敌方塔血量比例，用于检测塔伤害和拆塔事件
+        self._prev_enemy_tower_hp_ratio = 1.0
         self.cached_main_tower_pos = None
         self.cached_enemy_tower_pos = None
         # 狄仁杰 S3 黄牌破甲追击窗口
@@ -128,11 +130,25 @@ class GameRewardManager:
         return self.m_reward_value
 
     @staticmethod
+    def _sigmoid(x):
+        if x < -20.0:
+            return 0.0
+        if x > 20.0:
+            return 1.0
+        return 1.0 / (1.0 + math.exp(-x))
+
+    @staticmethod
     def _safe_get(d, key, default=0):
         if d is None:
             return default
         value = d.get(key, default)
         return default if value is None else value
+
+    @staticmethod
+    def _is_attacking_frame(action):
+        if action is None:
+            return False
+        return action[0] in GameConfig.ATTACK_BUTTON_INDICES
 
     def _calc_total_exp(self, hero):
         if hero is None:
@@ -814,6 +830,12 @@ class GameRewardManager:
         
         for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
 
+            # 共享变量，避免各奖励项重复遍历帧数据
+            main_hp_ratio = self.m_main_calc_frame_map["hp_point"].cur_frame_value
+            enemy_hp_ratio = self.m_enemy_calc_frame_map["hp_point"].cur_frame_value
+            enemy_alive = enemy_hp_ratio > 0
+            is_attacking = self._is_attacking_frame(action)
+
             # =========================================================
             # 机制 1：血线门控的推进奖励 (HP-Gated Forward)
             # =========================================================
@@ -822,14 +844,22 @@ class GameRewardManager:
                 last_forward = self.m_main_calc_frame_map[reward_name].last_frame_value
                 forward_delta = cur_forward - last_forward
 
-                hp_rate = self.m_main_calc_frame_map["hp_point"].cur_frame_value
-                enemy_hp = self.m_enemy_calc_frame_map["hp_point"].cur_frame_value
-                enemy_alive = enemy_hp > 0
-
                 if not enemy_alive:
-                    if hp_rate > 0.3:
+                    if main_hp_ratio > 0.3:
                         # 敌方阵亡且我方健康：激发推塔欲望，放大 5 倍
                         reward_struct.value = forward_delta * 5.0
+                        # P3: 击杀后推塔放大 — 在敌塔12000范围内额外激励
+                        if self.cached_enemy_tower_pos:
+                            main_hero_pos = None
+                            for hero in frame_data.get("hero_states", []):
+                                if hero["runtime_id"] == self.main_hero_player_id:
+                                    main_hero_pos = (hero["location"]["x"], hero["location"]["z"])
+                                    break
+                            if main_hero_pos:
+                                dist_to_enemy_tower = math.dist(main_hero_pos, self.cached_enemy_tower_pos)
+                                if dist_to_enemy_tower < 12000.0:
+                                    t = 1.0 - dist_to_enemy_tower / 12000.0
+                                    reward_struct.value += 0.03 * t
                     else:
                         # 敌方阵亡但我方残血：触发求生欲，禁止推进
                         if forward_delta > 0:
@@ -846,11 +876,7 @@ class GameRewardManager:
             # 机制 2：安全回城的显式动作奖励 (Explicit Recall Reward)
             # =========================================================
             elif reward_name == "recall":
-                hp_rate = self.m_main_calc_frame_map["hp_point"].cur_frame_value
-                enemy_hp = self.m_enemy_calc_frame_map["hp_point"].cur_frame_value
-                enemy_alive = enemy_hp > 0
-                
-                # 获取双方坐标计算距离
+                # 获取双方英雄坐标
                 main_hero_pos, enemy_hero_pos = None, None
                 for hero in frame_data.get("hero_states", []):
                     if hero["runtime_id"] == self.main_hero_player_id:
@@ -858,28 +884,35 @@ class GameRewardManager:
                     else:
                         enemy_hero_pos = (hero["location"]["x"], hero["location"]["z"])
 
-                dist_enemy = 999999.0
-                if main_hero_pos and enemy_hero_pos:
-                    dist_enemy = math.dist(main_hero_pos, enemy_hero_pos)
+                # 获取防御塔坐标，判定英雄是否在己方塔后
+                main_tower_pos = None
+                enemy_tower_pos = None
+                for organ in frame_data.get("npc_states", []):
+                    if organ["sub_type"] == 21:
+                        if organ["camp"] == self.main_hero_camp:
+                            main_tower_pos = (organ["location"]["x"], organ["location"]["z"])
+                        else:
+                            enemy_tower_pos = (organ["location"]["x"], organ["location"]["z"])
 
-                # 判断绝对安全环境（引擎尺度下，普通射程约8000，12000以上属于绝对安全区）
-                is_safe = (not enemy_alive) or (dist_enemy > 12000.0)
+                behind_tower = False
+                if main_hero_pos and main_tower_pos and enemy_tower_pos:
+                    hero_to_enemy_tower = math.dist(main_hero_pos, enemy_tower_pos)
+                    main_to_enemy_tower = math.dist(main_tower_pos, enemy_tower_pos)
+                    behind_tower = hero_to_enemy_tower > main_to_enemy_tower
 
-                # 条件触发：残血 + 环境安全 + 按下回城键
-                if hp_rate <= 0.3 and is_safe and action is not None:
-                    # 提取 button action
+                is_safe = (not enemy_alive) or behind_tower
+
+                if main_hp_ratio <= 0.3 and is_safe and action is not None:
                     if action[0] == GameConfig.RECALL_BUTTON_INDEX:
                         self.consecutive_recall_frames += 1
-                        # 核心修复点：要求连续吟唱 ~105 帧（~7秒 @15fps）等于完整回城吟唱时间
-                        if self.consecutive_recall_frames == 105:
-                            reward_struct.value = 1.0  # 完成完整回城吟唱，给予一次性大额奖励
+                        if self.consecutive_recall_frames >= 2:
+                            reward_struct.value = 0.05
                         else:
-                            reward_struct.value = 0.0  # 吟唱期间（或已发过奖励后）不给分
+                            reward_struct.value = 0.0
                     else:
                         self.consecutive_recall_frames = 0
                         reward_struct.value = 0.0
                 else:
-                    # 不满足条件（例如血量回上来了，或者敌人靠近了）清空打断计数
                     self.consecutive_recall_frames = 0
                     reward_struct.value = 0.0
 
@@ -917,33 +950,57 @@ class GameRewardManager:
                     start_x, start_z = self.pos_window[0]
                     end_x, end_z = self.pos_window[-1]
                     dist = math.sqrt((start_x - end_x)**2 + (start_z - end_z)**2)
-                    main_hp_cur = self.m_main_calc_frame_map["hp_point"].cur_frame_value
-                    
-                    # 惩罚条件：过去15帧(近1秒)没怎么动(距离<1000)，且血量健康(>70%)
-                    # 如果残血，可能是躲在塔下回城，予以宽容；如果满血还在发呆，重罚！
-                    if dist < 1000 and main_hp_cur > 0.7:
-                        camp_penalty = -0.05
+
+                    if dist < GameConfig.ANTI_CAMP_MIN_DIST:
+                        dist_factor = 1.0 - dist / GameConfig.ANTI_CAMP_MIN_DIST
+                        hp_center = (GameConfig.ANTI_CAMP_HP_UPPER + GameConfig.ANTI_CAMP_HP_LOWER) / 2.0
+                        hp_span = (GameConfig.ANTI_CAMP_HP_UPPER - GameConfig.ANTI_CAMP_HP_LOWER) / 6.0
+                        hp_factor = self._sigmoid((main_hp_ratio - hp_center) / max(hp_span, 0.01))
+                        camp_penalty = GameConfig.ANTI_CAMP_MAX_PENALTY * dist_factor * hp_factor
                 reward_struct.value = camp_penalty
             elif reward_name == "kiting":
                 kiting_bonus = 0.0
                 main_hero_pos, enemy_hero_pos = None, None
-                enemy_hp = 0
-
-                # 从当前帧数据中遍历获取双方位置和敌方血量
                 for hero in frame_data["hero_states"]:
                     if hero["runtime_id"] == self.main_hero_player_id:
                         main_hero_pos = (hero["location"]["x"], hero["location"]["z"])
                     else:
                         enemy_hero_pos = (hero["location"]["x"], hero["location"]["z"])
-                        enemy_hp = float(self._safe_get(hero, "hp", 0))
 
-                # 必须确认拿到了坐标，且敌方存活才计算奖励
-                if main_hero_pos and enemy_hero_pos and enemy_hp > 0:
+                if main_hero_pos and enemy_hero_pos and enemy_alive:
                     dist_enemy = math.dist(main_hero_pos, enemy_hero_pos)
-                    if 6000 <= dist_enemy <= 8500:
-                        kiting_bonus = 0.02   # 处于极佳射程，持续给微小正反馈
-                    elif dist_enemy < 4000:
-                        kiting_bonus = -0.05  # 距离过近，面临被秒杀风险，重罚
+
+                    # 追逐动态缩放：敌方越残，危险区边界越小，鼓励追击收割
+                    chase_weight = max(0.0, 1.0 - enemy_hp_ratio / GameConfig.KITING_CHASE_HP_THRESHOLD)
+                    eff_danger = GameConfig.KITING_DANGER_DIST * (1.0 - chase_weight)
+                    eff_optimal_min = GameConfig.KITING_OPTIMAL_MIN * (1.0 - chase_weight)
+
+                    if dist_enemy <= eff_danger:
+                        t = (dist_enemy / eff_danger) if eff_danger > 1.0 else 1.0
+                        raw_penalty = -GameConfig.KITING_DIST_COEFF * 2.0 * (1.0 - t)
+                        kiting_bonus = 0.0 if is_attacking else raw_penalty
+
+                    elif dist_enemy <= eff_optimal_min:
+                        span = eff_optimal_min - eff_danger
+                        t = ((dist_enemy - eff_danger) / span) if span > 1.0 else 1.0
+                        kiting_bonus = GameConfig.KITING_DIST_COEFF * t
+
+                    elif dist_enemy <= GameConfig.KITING_OPTIMAL_MAX:
+                        kiting_bonus = GameConfig.KITING_DIST_COEFF
+
+                    elif dist_enemy <= GameConfig.IDLE_PENALTY_DIST:
+                        span = GameConfig.IDLE_PENALTY_DIST - GameConfig.KITING_OPTIMAL_MAX
+                        t = ((dist_enemy - GameConfig.KITING_OPTIMAL_MAX) / span) if span > 1.0 else 1.0
+                        kiting_bonus = GameConfig.KITING_DIST_COEFF * (1.0 - t)
+
+                    else:
+                        # 距离敌人 > IDLE_PENALTY_DIST：怠惰惩罚
+                        if is_attacking:
+                            kiting_bonus = 0.0
+                        elif main_hp_ratio > GameConfig.IDLE_PENALTY_HP_THRESHOLD:
+                            kiting_bonus = GameConfig.IDLE_PENALTY_VALUE
+                        else:
+                            kiting_bonus = 0.0
                 reward_struct.value = kiting_bonus
 
             # ---------- 基础状态零和差分 ----------
@@ -961,5 +1018,41 @@ class GameRewardManager:
             weight_sum += reward_struct.weight
             reward_sum += reward_struct.value * reward_struct.weight
             reward_dict[reward_name] = reward_struct.value
-            
+
+        # ================================================================
+        # P0 & P1: 推塔即时反馈 + 拆塔里程碑奖励
+        #
+        # P1 — 塔伤害即时反馈: 当己方英雄在敌方塔附近(15000内)且塔本帧
+        #      受到伤害时，按掉血比例给予即时奖励。解决了原来 "攻击→等一帧
+        #      →HP下降→tower_hp_point差分" 的延迟问题。
+        # P0 — 拆塔里程碑: 敌方塔血量首次归零时给予 +10.0 一次性奖励，
+        #      直接强化胜利条件。
+        # ================================================================
+        enemy_tower_hp_ratio = self.m_enemy_calc_frame_map["tower_hp_point"].cur_frame_value
+        if self._prev_enemy_tower_hp_ratio > 0:
+            tower_damage_ratio = self._prev_enemy_tower_hp_ratio - enemy_tower_hp_ratio
+
+            # P1: 塔伤害即时反馈 (仅在英雄靠近敌方塔时触发)
+            if tower_damage_ratio > 0:
+                hero_near_enemy_tower = False
+                main_hero_pos = None
+                for hero in frame_data.get("hero_states", []):
+                    if hero["runtime_id"] == self.main_hero_player_id:
+                        main_hero_pos = (hero["location"]["x"], hero["location"]["z"])
+                        break
+                if main_hero_pos and self.cached_enemy_tower_pos:
+                    dist_to_enemy_tower = math.dist(main_hero_pos, self.cached_enemy_tower_pos)
+                    hero_near_enemy_tower = dist_to_enemy_tower < 15000.0
+
+                if hero_near_enemy_tower:
+                    tower_damage_reward = tower_damage_ratio * 3.0
+                    reward_dict["tower_damage"] = tower_damage_reward
+                    reward_sum += tower_damage_reward
+
+            # P0: 拆塔里程碑奖励 (敌方塔从存活变为被摧毁)
+            if enemy_tower_hp_ratio <= 0:
+                reward_dict["tower_destroy"] = 10.0
+                reward_sum += 10.0
+
+        self._prev_enemy_tower_hp_ratio = enemy_tower_hp_ratio
         reward_dict["reward_sum"] = reward_sum

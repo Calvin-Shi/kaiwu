@@ -12,32 +12,59 @@ class GameConfig:
     # Set the weight of each reward item and use it in reward_manager
     # 设置各个回报项的权重，在reward_manager中使用
     REWARD_WEIGHT_DICT = {
-        # 推塔 / 守塔：防御塔血量比例
-        "tower_hp_point": 5.0,
-        # 前进：鼓励靠近敌方防御塔
-        "forward": 0.01,
-        "recall": 1.0,  # <--- 【新增】注册回城奖励及其初始权重
+        # 推塔：胜负核心，最高权重
+        "tower_hp_point": 8.0,
+        # 前进：适度加强位置引导
+        "forward": 0.02,
+        "recall": 1.0,
         # 生命值比例差（零和）
         "hp_point": 2.0,
         # 金币差（零和）
         "money": 0.002,
         # 经验差（零和）
         "exp": 0.005,
-        # 击杀敌方英雄
-        "kill": 3.0,
-        # 自身被击杀
-        "death": -3.0,
+        # 击杀：对局关键事件
+        "kill": 4.0,
+        # 被击杀：对称于击杀
+        "death": -4.0,
         # 法力值比例（零和）
         "ep_rate": 0.5,
-        "hero_combo_window": 1.0,  # 【新增】英雄专属连招与状态窗口奖励
-        "kill_gold_consistency": 1.0,   # 【新增】击杀与经济一致性纠偏
-        "kill_tower_consistency": 1.0,  # 【新增】击杀与推塔一致性纠偏
-        "skill5_flash": 1.0,           # 【新增】闪现边沿检测与事件关联奖励
-        "cake_hunt": 2.0,             # 【新增】蛋糕/血包趋向奖励
-        "cake_pickup": 5.0,           # 【新增】蛋糕/血包拾取瞬间奖励
+        "hero_combo_window": 1.5,
+        # 降低一致性惩罚权重，防止 AI 因怕惩罚而不敢打架
+        "kill_gold_consistency": 0.3,
+        "kill_tower_consistency": 0.3,
+        "skill5_flash": 0.5,
+        # 降低蛋糕权重，防止 AI 过度关注吃蛋糕而忽视推塔
+        "cake_hunt": 0.5,
+        "cake_pickup": 2.0,
     }
     # 动作空间宏定义
     RECALL_BUTTON_INDEX = 9  # <--- 【新增】12维离散空间中第9位为回城
+
+    # ==================================================================
+    # 攻击/施法动作索引，Kiting 危险区惩罚时对这些动作豁免
+    ATTACK_BUTTON_INDICES = [1, 2, 3, 4, 5, 6]
+
+    # ==================================================================
+    # Kiting 拉扯弹性距离参数
+    KITING_OPTIMAL_MIN = 6000
+    KITING_OPTIMAL_MAX = 8500
+    KITING_DANGER_DIST = 4000
+    KITING_DIST_COEFF = 0.02
+    # 怠惰惩罚：距离敌人超过此值且血量健康时每帧惩罚
+    IDLE_PENALTY_DIST = 9500
+    IDLE_PENALTY_VALUE = -0.02
+    IDLE_PENALTY_HP_THRESHOLD = 0.5
+    # 追逐缩放：敌方血量低于此比例时，危险边界线性收缩
+    KITING_CHASE_HP_THRESHOLD = 0.30
+
+    # ==================================================================
+    # Anti-camp 连续平滑参数
+    ANTI_CAMP_MIN_DIST = 1000
+    ANTI_CAMP_HP_UPPER = 0.9
+    ANTI_CAMP_HP_LOWER = 0.3
+    ANTI_CAMP_MAX_PENALTY = -0.05
+
     # Time decay factor, used in reward_manager
     # 时间衰减因子，在reward_manager中使用
     TIME_SCALE_ARG = 0
@@ -54,7 +81,7 @@ class GameConfig:
 #   防御塔: is_alive(1) + belong_to_main_camp(1) + location_x(1) + location_z(1)
 #         + relative_location_x(1) + relative_location_z(1) + hp_rate(1) = 7
 class DimConfig:
-    DIM_OF_FEATURE = [144]
+    DIM_OF_FEATURE = [145]
 
 
 # Configuration related to model and algorithms used
@@ -62,22 +89,25 @@ class DimConfig:
 class Config:
     NETWORK_NAME = "network"
     LSTM_TIME_STEPS = 16
-    LSTM_UNIT_SIZE = 128
+    LSTM_UNIT_SIZE = 512
     DATA_SPLIT_SHAPE = [
-        144 + 85,  # 229  feature + legal
+        145 + 85,  # 230  feature + legal
         1, 1, 1, 1, 1, 1, 1, 1,      # 8   reward, advantage, action[6]
         12, 16, 16, 16, 16, 9,        # 6   old label probabilities
         1, 1, 1, 1, 1, 1, 1,          # 7   sub_action[6], is_train
         LSTM_UNIT_SIZE,                # lstm cell
         LSTM_UNIT_SIZE,                # lstm hidden
     ]
-    SERI_VEC_SPLIT_SHAPE = [(144,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(145,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
     LOG_EPSILON = 1e-6
     LABEL_SIZE_LIST = [12, 16, 16, 16, 16, 9]
     IS_REINFORCE_TASK_LIST = [True] * 6
+
+    # P0: 伪自回归 Target Head — Button Embedding 维度
+    BUTTON_EMBED_DIM = 64
 
     CLIP_PARAM = 0.15
     MIN_POLICY = 0.00001
@@ -89,7 +119,7 @@ class Config:
     # data_shapes: per-frame sample element sizes (last 2 = lstm hidden/cell)
     LS = LABEL_SIZE_LIST
     data_shapes = [
-        [(144 + 85) * 16],
+        [(145 + 85) * 16],
         [16], [16], [16], [16], [16], [16], [16], [16],
         [LS[0] * 16], [LS[1] * 16], [LS[2] * 16], [LS[3] * 16], [LS[4] * 16], [LS[5] * 16],
         [16], [16], [16], [16], [16], [16], [16],

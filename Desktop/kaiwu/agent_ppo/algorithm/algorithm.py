@@ -78,6 +78,17 @@ class Algorithm:
             adv_normalized = (adv - adv.mean()) / (adv.std() + 1e-8)
             data_list[2] = adv_normalized
 
+        # =========================================================
+        # 【高阶经验 3】：Batch-level 回报归一化 (Reward Normalization)
+        # 配合 Advantage 归一化，避免 kill=4.0、tower_destroy=10.0 等
+        # 大量级 reward 导致 value loss 剧烈震荡。
+        # =========================================================
+        # data_list[1] 根据 Config.DATA_SPLIT_SHAPE 对齐的是 Reward
+        rew = data_list[1]
+        if rew.shape[0] > 1:
+            rew_normalized = (rew - rew.mean()) / (rew.std() + 1e-8)
+            data_list[1] = rew_normalized
+
         # 序列化特征切分
         seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])
         feature, legal_action = seri_vec.split(

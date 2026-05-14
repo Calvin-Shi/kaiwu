@@ -90,6 +90,29 @@ class FeatureProcess:
 
         in_tower_danger = 1.0 if (tower_alive and dist_tower < 8500) else 0.0
 
+        # P2: 统计己方小兵中有多少个靠近敌方塔（塔15000内的小兵数/4）
+        minion_push_count = 0
+        TOWER_PUSH_RANGE = 15000.0
+        if tower_alive:
+            for npc in frame_state.get("npc_states", []):
+                if str(npc.get("sub_type", "")) not in ("ACTOR_SUB_SOLDIER", "11"):
+                    continue
+                if npc.get("hp", 0) <= 0:
+                    continue
+                if npc.get("camp") != self.camp:
+                    continue
+                loc = npc.get("location", {})
+                sx = loc.get("x", 100000)
+                sz = loc.get("z", 100000)
+                if sx == 100000 or sz == 100000:
+                    continue
+                if self.camp == "PLAYERCAMP_2":
+                    sx, sz = -sx, -sz
+                dist_to_tower = math.sqrt((sx - tower_x)**2 + (sz - tower_z)**2)
+                if dist_to_tower < TOWER_PUSH_RANGE:
+                    minion_push_count += 1
+        minion_push_feat = min(1.0, minion_push_count / 4.0)
+
         dx = hero_x - self.last_hero_x
         dz = hero_z - self.last_hero_z
 
@@ -117,6 +140,7 @@ class FeatureProcess:
             in_tower_danger,
             dx_norm,
             dz_norm,
-            cos_sim
+            cos_sim,
+            minion_push_feat,
         ]
         return adv_feats
