@@ -207,7 +207,7 @@ class GameRewardManager:
             elif reward_name == "forward":
                 reward_struct.cur_frame_value = self.calculate_forward(main_hero, main_tower, enemy_tower)
             elif reward_name == "hp_point":
-                reward_struct.cur_frame_value = hp / max_hp
+                reward_struct.cur_frame_value = math.sqrt(math.sqrt(hp / max_hp))
             elif reward_name == "ep_rate":
                 reward_struct.cur_frame_value = ep / max_ep
             elif reward_name == "money":
@@ -871,6 +871,11 @@ class GameRewardManager:
                 else:
                     # 敌方存活时的常规推进奖励
                     reward_struct.value = forward_delta
+
+                # 后期移除 forward 奖励，防止 AI 在中后期无意义前压
+                if GameConfig.REMOVE_FORWARD_AFTER is not None:
+                    frame_no = frame_data.get("frame_no", 0)
+                    reward_struct.value *= (frame_no <= GameConfig.REMOVE_FORWARD_AFTER)
 
             # =========================================================
             # 机制 2：安全回城的显式动作奖励 (Explicit Recall Reward)

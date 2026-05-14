@@ -66,8 +66,10 @@ class GameConfig:
     ANTI_CAMP_MAX_PENALTY = -0.05
 
     # Time decay factor, used in reward_manager
-    # 时间衰减因子，在reward_manager中使用
-    TIME_SCALE_ARG = 0
+    # 时间衰减因子，在reward_manager中使用；值越大衰减越慢
+    TIME_SCALE_ARG = 8000
+    # 指定帧数后移除 forward 奖励，防止后期无效前压
+    REMOVE_FORWARD_AFTER = 1000
     # Model save interval configuration, used in workflow
     # 模型保存间隔配置，在workflow中使用
     MODEL_SAVE_INTERVAL = 1800
@@ -75,13 +77,14 @@ class GameConfig:
 
 # Dimension configuration, used when building the model
 # 维度配置，构建模型时使用
-# 特征维度 = 12(英雄) + 7(防御塔) = 19
-#   英雄: is_alive(1) + location_x(1) + location_z(1) + hp_rate(1)
-#        + ep_rate(1) + level(1) + money(1) + skill_cooldown(5) = 12
-#   防御塔: is_alive(1) + belong_to_main_camp(1) + location_x(1) + location_z(1)
-#         + relative_location_x(1) + relative_location_z(1) + hp_rate(1) = 7
+# 特征维度 159 = 39(self_hero) + 39(emy_hero) + 7(organ) + 11(tactical)
+#              + 28(fri_soldiers_4x7) + 28(emy_soldiers_4x7) + 7(resource)
+#   英雄(39): is_alive(1) + loc_x(1) + loc_z(1) + hp_rate(1) + ep_rate(1)
+#            + level(1) + money(1) + auto_attack(1)
+#            + skill_cd(5x4=20) + rel_to_opp(3) + in_tower_range(1)
+#            + buffs(5) + cake_dist(2)
 class DimConfig:
-    DIM_OF_FEATURE = [145]
+    DIM_OF_FEATURE = [159]
 
 
 # Configuration related to model and algorithms used
@@ -89,16 +92,16 @@ class DimConfig:
 class Config:
     NETWORK_NAME = "network"
     LSTM_TIME_STEPS = 16
-    LSTM_UNIT_SIZE = 512
+    LSTM_UNIT_SIZE = 576
     DATA_SPLIT_SHAPE = [
-        145 + 85,  # 230  feature + legal
+        159 + 85,  # 244  feature + legal
         1, 1, 1, 1, 1, 1, 1, 1,      # 8   reward, advantage, action[6]
         12, 16, 16, 16, 16, 9,        # 6   old label probabilities
         1, 1, 1, 1, 1, 1, 1,          # 7   sub_action[6], is_train
         LSTM_UNIT_SIZE,                # lstm cell
         LSTM_UNIT_SIZE,                # lstm hidden
     ]
-    SERI_VEC_SPLIT_SHAPE = [(145,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(159,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
@@ -119,7 +122,7 @@ class Config:
     # data_shapes: per-frame sample element sizes (last 2 = lstm hidden/cell)
     LS = LABEL_SIZE_LIST
     data_shapes = [
-        [(145 + 85) * 16],
+        [(159 + 85) * 16],
         [16], [16], [16], [16], [16], [16], [16], [16],
         [LS[0] * 16], [LS[1] * 16], [LS[2] * 16], [LS[3] * 16], [LS[4] * 16], [LS[5] * 16],
         [16], [16], [16], [16], [16], [16], [16],

@@ -31,6 +31,27 @@ import os
 # 这里只依赖 slot_states 的顺序，取前 SKILL_SLOT_NUM 个槽位
 SKILL_SLOT_NUM = 5
 
+# Buff config_id 分组
+BUFF_HEAL_IDS = {10000, 10010, 10014, 90015}       # 回复/治疗相关
+BUFF_SPEED_IDS = {11001, 90015, 90025}              # 加速
+BUFF_SLOW_IDS = {11002}                             # 减速/被控
+BUFF_CLEANSE_IDS = {11010, 911290}                  # 净化/免控
+
+def _hero_has_buff(hero, id_set):
+    buffs = hero.get("buff_state", []) or []
+    if not isinstance(buffs, list):
+        return False
+    for b in buffs:
+        bid = b.get("config_id", 0) if isinstance(b, dict) else b
+        if bid and int(bid) in id_set:
+            return True
+    return False
+
+CAKE_LOCATIONS_BY_CAMP = {
+    "PLAYERCAMP_1": {"main": (-15220, -15120), "enemy": (15340, 15100)},
+    "PLAYERCAMP_2": {"main": (15340, 15100), "enemy": (-15220, -15120)},
+}
+
 
 class HeroProcess:
     def __init__(self, camp):
@@ -48,9 +69,11 @@ class HeroProcess:
         #   hp_rate(1) + ep_rate(1) + level(1) + money(1) +
         #   auto_attack_available(1) +
         #   skill_cooldown(5×4: cd_ratio, usable, hit_rate, use_rate_recent) +
-        #   rel_to_opponent(3) + is_in_enemy_tower_range(1)
-        # = 8 + 5*4 + 3 + 1 = 32
-        self.one_unit_feature_num = 8 + 4 * SKILL_SLOT_NUM + 3 + 1
+        #   rel_to_opponent(3) + is_in_enemy_tower_range(1) +
+        #   buff_features(5: heal, speed, debuff, cleanse, hero_passive) +
+        #   cake_dist_features(2: dist_to_main_cake, dist_to_enemy_cake)
+        # = 8 + 5*4 + 3 + 1 + 5 + 2 = 39
+        self.one_unit_feature_num = 8 + 4 * SKILL_SLOT_NUM + 3 + 1 + 5 + 2
 
         # 缓存敌方/我方防御塔位置，用于越塔预警
         self.main_tower_pos = None
@@ -409,5 +432,55 @@ class HeroProcess:
 
         if dist_to_tower <= TOWER_ATK_RADIUS:
             vector_feature.append(1.0)
+        else:
+            vector_feature.append(0.0)
+
+    # ==================================================================
+    # 新增：Buff 状态特征（5 维）
+    # ==================================================================
+    def get_buff_features(self, hero, vector_feature, feature_name):
+        has_heal = 1.0 if _hero_has_buff(hero, BUFF_HEAL_IDS) else 0.0
+        has_speed = 1.0 if _hero_has_buff(hero, BUFF_SPEED_IDS) else 0.0
+        has_slow = 1.0 if _hero_has_buff(hero, BUFF_SLOW_IDS) else 0.0
+        has_cleanse = 1.0 if _hero_has_buff(hero, BUFF_CLEANSE_IDS) else 0.0
+
+        # 英雄专属被动 buff：鲁班的强化普攻 / 狄仁杰的破甲窗口
+        config_id = hero.get("actor_state", {}).get("config_id", 0) if hero else 0
+        has_passive = 0.0
+        if config_id == 112:   # 鲁班七号
+            has_passive = 1.0 if _hero_has_buff(hero, {112001, 112015, 112025,
+                112035, 112040, 112043, 112044, 112045, 112046, 112047,
+                112048, 112100, 112200, 112201, 112300, 112301, 112320,
+                112890, 112910, 112990, 112991}) else 0.0
+        elif config_id == 133:  # 狄仁杰
+            has_passive = 1.0 if _hero_has_buff(hero, {133000, 133001,
+                133010, 133011, 133020, 133090, 133200, 133250, 133260,
+                133950, 133951}) else 0.0
+
+        vector_feature.extend([has_heal, has_speed, has_slow, has_cleanse, has_passive])
+
+    # ==================================================================
+    # 新增：蛋糕距离特征（2 维：到主方蛋糕距离、到敌方蛋糕距离）
+    # ==================================================================
+    def get_cake_dist_features(self, hero, vector_feature, feature_name):
+        hero_camp = hero.get("camp") if hero else None
+        cake_map = CAKE_LOCATIONS_BY_CAMP.get(hero_camp, {})
+        main_cake = cake_map.get("main")
+        enemy_cake = cake_map.get("enemy")
+
+        my_loc = hero.get("location", {}) or {}
+        hx = float(self._safe_get(my_loc, "x", 0))
+        hz = float(self._safe_get(my_loc, "z", 0))
+        MAP_DIAG = 42428.0
+
+        if main_cake and hx != 100000 and hz != 100000:
+            d_main = math.hypot(hx - main_cake[0], hz - main_cake[1]) / MAP_DIAG
+            vector_feature.append(max(0.0, min(1.0, d_main)))
+        else:
+            vector_feature.append(0.0)
+
+        if enemy_cake and hx != 100000 and hz != 100000:
+            d_enemy = math.hypot(hx - enemy_cake[0], hz - enemy_cake[1]) / MAP_DIAG
+            vector_feature.append(max(0.0, min(1.0, d_enemy)))
         else:
             vector_feature.append(0.0)
