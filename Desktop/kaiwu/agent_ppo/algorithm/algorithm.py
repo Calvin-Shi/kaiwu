@@ -69,7 +69,7 @@ class Algorithm:
         # =========================================================
         # 【高阶经验 2】：Batch-level 优势函数归一化 (Advantage Normalization)
         # 在送入 PPO 计算之前，对整个 Batch 的 Advantage 进行归一化。
-        # 此举能完美化解 hp_trade 和 last_hit 导致的不同批次间回报尺度不一致的问题。
+        # 此举能化解 last_hit 等累积奖励项导致的不同批次间回报尺度不一致的问题。
         # =========================================================
         # data_list[2] 根据 Config.DATA_SPLIT_SHAPE 对齐的是 Advantage
         adv = data_list[2]
@@ -77,17 +77,6 @@ class Algorithm:
             # 加上 1e-8 防止除 0 崩溃
             adv_normalized = (adv - adv.mean()) / (adv.std() + 1e-8)
             data_list[2] = adv_normalized
-
-        # =========================================================
-        # 【高阶经验 3】：Batch-level 回报归一化 (Reward Normalization)
-        # 配合 Advantage 归一化，避免 kill=4.0、tower_destroy=10.0 等
-        # 大量级 reward 导致 value loss 剧烈震荡。
-        # =========================================================
-        # data_list[1] 根据 Config.DATA_SPLIT_SHAPE 对齐的是 Reward
-        rew = data_list[1]
-        if rew.shape[0] > 1:
-            rew_normalized = (rew - rew.mean()) / (rew.std() + 1e-8)
-            data_list[1] = rew_normalized
 
         # 序列化特征切分
         seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])

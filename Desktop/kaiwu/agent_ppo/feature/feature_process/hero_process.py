@@ -32,10 +32,13 @@ import os
 SKILL_SLOT_NUM = 5
 
 # Buff config_id 分组
-BUFF_HEAL_IDS = {10000, 10010, 10014, 90015}       # 回复/治疗相关
-BUFF_SPEED_IDS = {11001, 90015, 90025}              # 加速
-BUFF_SLOW_IDS = {11002}                             # 减速/被控
-BUFF_CLEANSE_IDS = {11010, 911290}                  # 净化/免控
+BUFF_HEAL_IDS = {10000, 10010, 10014, 90015, 914110, 914210, 914211}  # 回复/治疗相关
+BUFF_SPEED_IDS = {11001, 90015, 90025}                                 # 加速
+BUFF_SLOW_IDS = {11002}                                                # 减速/被控
+BUFF_CLEANSE_IDS = {11010, 911290, 911260, 911261, 912330, 919900}    # 净化/免控
+BUFF_OTHER_NOTABLE = {50000, 500009, 801100, 90019, 90110,            # 其他已知buff
+                       912260, 912262, 912263, 914230, 914232,
+                       131956, 167600, 167602}
 
 def _hero_has_buff(hero, id_set):
     buffs = hero.get("buff_state", []) or []
@@ -71,9 +74,10 @@ class HeroProcess:
         #   skill_cooldown(5×4: cd_ratio, usable, hit_rate, use_rate_recent) +
         #   rel_to_opponent(3) + is_in_enemy_tower_range(1) +
         #   buff_features(5: heal, speed, debuff, cleanse, hero_passive) +
-        #   cake_dist_features(2: dist_to_main_cake, dist_to_enemy_cake)
-        # = 8 + 5*4 + 3 + 1 + 5 + 2 = 39
-        self.one_unit_feature_num = 8 + 4 * SKILL_SLOT_NUM + 3 + 1 + 5 + 2
+        #   cake_dist_features(2) + attack_speed(1) + move_speed(1) +
+        #   is_under_tower_atk(1)
+        # = 8 + 5*4 + 3 + 1 + 5 + 2 + 3 = 42
+        self.one_unit_feature_num = 8 + 4 * SKILL_SLOT_NUM + 3 + 1 + 5 + 2 + 3
 
         # 缓存敌方/我方防御塔位置，用于越塔预警
         self.main_tower_pos = None
@@ -107,7 +111,8 @@ class HeroProcess:
             else:
                 raise ValueError(f"Unsupported function: {func_name}")
 
-    def process_vec_hero(self, frame_state):
+    def process_vec_hero(self, frame_state, raw_obs=None):
+        self.raw_obs = raw_obs
         self.generate_hero_info_list(frame_state)
         self._cache_tower_positions(frame_state)
 
@@ -448,14 +453,16 @@ class HeroProcess:
         config_id = hero.get("actor_state", {}).get("config_id", 0) if hero else 0
         has_passive = 0.0
         if config_id == 112:   # 鲁班七号
-            has_passive = 1.0 if _hero_has_buff(hero, {112001, 112015, 112025,
-                112035, 112040, 112043, 112044, 112045, 112046, 112047,
-                112048, 112100, 112200, 112201, 112300, 112301, 112320,
-                112890, 112910, 112990, 112991}) else 0.0
+            has_passive = 1.0 if _hero_has_buff(hero, {112000, 112001,
+                112010, 112015, 112020, 112025, 112030, 112035, 112040,
+                112041, 112042, 112043, 112044, 112045, 112046, 112047,
+                112048, 112100, 112190, 112191, 112192, 112200, 112201,
+                112210, 112300, 112301, 112320, 112890, 112910, 112990,
+                112991}) else 0.0
         elif config_id == 133:  # 狄仁杰
             has_passive = 1.0 if _hero_has_buff(hero, {133000, 133001,
-                133010, 133011, 133020, 133090, 133200, 133250, 133260,
-                133950, 133951}) else 0.0
+                133010, 133011, 133020, 133090, 133100, 133200, 133250,
+                133260, 133300, 133310, 133950, 133951}) else 0.0
 
         vector_feature.extend([has_heal, has_speed, has_slow, has_cleanse, has_passive])
 
@@ -484,3 +491,24 @@ class HeroProcess:
             vector_feature.append(max(0.0, min(1.0, d_enemy)))
         else:
             vector_feature.append(0.0)
+
+    # ==================================================================
+    # 新增：英雄攻速、移速、是否正在被塔攻击（3 维）
+    # ==================================================================
+    def get_hero_attack_speed(self, hero, vector_feature, feature_name):
+        value = float(self._safe_get(hero, "attack_speed", 0))
+        vector_feature.append(value)
+
+    def get_hero_move_speed(self, hero, vector_feature, feature_name):
+        value = float(self._safe_get(hero, "move_speed", 0))
+        vector_feature.append(value)
+
+    def get_is_under_tower_atk(self, hero, vector_feature, feature_name):
+        is_main = (hero.get("camp") == self.main_camp)
+        raw_obs = getattr(self, "raw_obs", None)
+        if raw_obs is not None and len(raw_obs) > 214:
+            idx = 86 if is_main else 214
+            value = float(raw_obs[idx])
+        else:
+            value = 0.0
+        vector_feature.append(value)

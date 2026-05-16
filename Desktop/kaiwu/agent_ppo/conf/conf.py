@@ -9,82 +9,48 @@ Author: Tencent AI Arena Authors
 
 
 class GameConfig:
-    # Set the weight of each reward item and use it in reward_manager
-    # 设置各个回报项的权重，在reward_manager中使用
+    # ==================================================================
+    # 奖励权重配置（9 项）
+    # ==================================================================
+    #   零和项 (tower_hp_point / hp_point / money / exp / kill / death):
+    #     单帧奖励 = (己方当前帧差值 - 敌方当前帧差值)
+    #   特殊项 (forward / ep_rate / last_hit): 见各自计算逻辑
+    # ==================================================================
     REWARD_WEIGHT_DICT = {
-        # 推塔：胜负核心，最高权重
-        "tower_hp_point": 8.0,
-        # 前进：适度加强位置引导
-        "forward": 0.02,
-        "recall": 1.0,
-        # 生命值比例差（零和）
-        "hp_point": 2.0,
-        # 金币差（零和）
-        "money": 0.002,
-        # 经验差（零和）
-        "exp": 0.005,
-        # 击杀：对局关键事件
-        "kill": 4.0,
-        # 被击杀：对称于击杀
-        "death": -4.0,
-        # 法力值比例（零和）
-        "ep_rate": 0.5,
-        "hero_combo_window": 1.5,
-        # 降低一致性惩罚权重，防止 AI 因怕惩罚而不敢打架
-        "kill_gold_consistency": 0.3,
-        "kill_tower_consistency": 0.3,
-        "skill5_flash": 0.5,
-        # 降低蛋糕权重，防止 AI 过度关注吃蛋糕而忽视推塔
-        "cake_hunt": 0.5,
-        "cake_pickup": 2.0,
+        "tower_hp_point": 10.0,   # 防御塔血量（零和，核心胜负条件）
+        "hp_point": 2.0,          # 英雄血量比例（零和，双开方）
+        "ep_rate": 0.75,          # 法力值比例（仅己方、仅增加时给奖励）
+        "last_hit": 0.5,          # 补刀小兵（己方+1，敌方-1）
+        "kill": -0.6,             # 击杀（零和，单次击杀净奖励=+0.4）
+        "death": -1.0,            # 死亡（零和，配合kill形成+0.4净奖励）
+        "forward": 0.01,          # 推进进度（HP>99%且英雄在塔后方时触发）
+        "money": 0.004,           # 金钱（零和）
+        "exp": 0.004,             # 经验（零和，满级后=0）
     }
-    # 动作空间宏定义
-    RECALL_BUTTON_INDEX = 9  # <--- 【新增】12维离散空间中第9位为回城
 
     # ==================================================================
-    # 攻击/施法动作索引，Kiting 危险区惩罚时对这些动作豁免
-    ATTACK_BUTTON_INDICES = [1, 2, 3, 4, 5, 6]
-
-    # ==================================================================
-    # Kiting 拉扯弹性距离参数
-    KITING_OPTIMAL_MIN = 6000
-    KITING_OPTIMAL_MAX = 8500
-    KITING_DANGER_DIST = 4000
-    KITING_DIST_COEFF = 0.02
-    # 怠惰惩罚：距离敌人超过此值且血量健康时每帧惩罚
-    IDLE_PENALTY_DIST = 9500
-    IDLE_PENALTY_VALUE = -0.02
-    IDLE_PENALTY_HP_THRESHOLD = 0.5
-    # 追逐缩放：敌方血量低于此比例时，危险边界线性收缩
-    KITING_CHASE_HP_THRESHOLD = 0.30
-
-    # ==================================================================
-    # Anti-camp 连续平滑参数
-    ANTI_CAMP_MIN_DIST = 1000
-    ANTI_CAMP_HP_UPPER = 0.9
-    ANTI_CAMP_HP_LOWER = 0.3
-    ANTI_CAMP_MAX_PENALTY = -0.05
-
-    # Time decay factor, used in reward_manager
-    # 时间衰减因子，在reward_manager中使用；值越大衰减越慢
+    # 时间衰减
+    #   公式: 最终奖励 = 基础奖励 * 0.6 ^ (frame_no / TIME_SCALE_ARG)
     TIME_SCALE_ARG = 8000
-    # 指定帧数后移除 forward 奖励，防止后期无效前压
+    # 指定帧数后移除 forward 奖励
     REMOVE_FORWARD_AFTER = 1000
-    # Model save interval configuration, used in workflow
-    # 模型保存间隔配置，在workflow中使用
+    # 模型保存间隔
     MODEL_SAVE_INTERVAL = 1800
 
 
 # Dimension configuration, used when building the model
 # 维度配置，构建模型时使用
-# 特征维度 159 = 39(self_hero) + 39(emy_hero) + 7(organ) + 11(tactical)
+# 特征维度 177 = 42(self_hero) + 42(emy_hero) + 7(organ) + 23(tactical)
 #              + 28(fri_soldiers_4x7) + 28(emy_soldiers_4x7) + 7(resource)
-#   英雄(39): is_alive(1) + loc_x(1) + loc_z(1) + hp_rate(1) + ep_rate(1)
+#   英雄(42): is_alive(1) + loc_x(1) + loc_z(1) + hp_rate(1) + ep_rate(1)
 #            + level(1) + money(1) + auto_attack(1)
 #            + skill_cd(5x4=20) + rel_to_opp(3) + in_tower_range(1)
-#            + buffs(5) + cake_dist(2)
+#            + buffs(5) + cake_dist(2) + attack_speed(1) + move_speed(1)
+#            + is_under_tower_atk(1)
+#   战术(23): 敌方状态(7) + 移动方向(3) + 兵线推进(1) + 子弹追踪(3)
+#            + 技能射程(4) + 游戏时间(5)
 class DimConfig:
-    DIM_OF_FEATURE = [159]
+    DIM_OF_FEATURE = [177]
 
 
 # Configuration related to model and algorithms used
@@ -94,14 +60,14 @@ class Config:
     LSTM_TIME_STEPS = 16
     LSTM_UNIT_SIZE = 576
     DATA_SPLIT_SHAPE = [
-        159 + 85,  # 244  feature + legal
+        177 + 85,  # 262  feature + legal
         1, 1, 1, 1, 1, 1, 1, 1,      # 8   reward, advantage, action[6]
         12, 16, 16, 16, 16, 9,        # 6   old label probabilities
         1, 1, 1, 1, 1, 1, 1,          # 7   sub_action[6], is_train
         LSTM_UNIT_SIZE,                # lstm cell
         LSTM_UNIT_SIZE,                # lstm hidden
     ]
-    SERI_VEC_SPLIT_SHAPE = [(159,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(177,), (85,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
@@ -122,7 +88,7 @@ class Config:
     # data_shapes: per-frame sample element sizes (last 2 = lstm hidden/cell)
     LS = LABEL_SIZE_LIST
     data_shapes = [
-        [(159 + 85) * 16],
+        [(177 + 85) * 16],
         [16], [16], [16], [16], [16], [16], [16], [16],
         [LS[0] * 16], [LS[1] * 16], [LS[2] * 16], [LS[3] * 16], [LS[4] * 16], [LS[5] * 16],
         [16], [16], [16], [16], [16], [16], [16],

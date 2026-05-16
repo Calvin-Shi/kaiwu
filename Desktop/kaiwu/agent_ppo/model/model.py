@@ -7,8 +7,8 @@
 Author: Tencent AI Arena Authors
 
 模块化分实体编码 + LSTM/Bypass 双路径 + Target 注意力 + Twin Critics。
-Hero(39)→Enc(64+32key) | Soldier(7)→Enc(32) max-pool×4
-Organ(7)→Enc(32+32key) | Resource(7)→Enc(32) | Tactical(11)→MLP(32)
+Hero(42)→Enc(64+32key) | Soldier(7)→Enc(32) max-pool×4
+Organ(7)→Enc(32+32key) | Resource(7)→Enc(32) | Tactical(23)→MLP(32)
 Concat(288)→[LSTM(2层) | Bypass MLP]→Merge(576→288)→Actor/Critic+Attention(32-dim)
 """
 
@@ -91,24 +91,24 @@ class Model(nn.Module):
         self.learning_rate = Config.INIT_LEARNING_RATE_START
         self.lstm_time_steps = Config.LSTM_TIME_STEPS
 
-        FEAT_DIM = 159
+        FEAT_DIM = 177
         HIDDEN = 288
         ATTN_D = 32
         ENC_H = 64
         self.button_embed_dim = Config.BUTTON_EMBED_DIM  # 64
 
         # ---- Entity encoders ----
-        # Hero: 39→64→(64 feat + 32 key)
-        self.hero_encoder = EntityEncoder(39, ENC_H, 64, ATTN_D)
+        # Hero: 42→64→(64 feat + 32 key)
+        self.hero_encoder = EntityEncoder(42, ENC_H, 64, ATTN_D)
         # Soldier: 7→32 (shared for all 8, no separate key)
         self.soldier_encoder = EntityEncoder(7, 32, ATTN_D, 0)
         # Organ: 7→64→(32 feat + 32 key)
         self.organ_encoder = EntityEncoder(7, ENC_H, ATTN_D, ATTN_D)
         # Resource: 7→32 (no separate key — use feat directly)
         self.resource_encoder = EntityEncoder(7, 32, ATTN_D, 0)
-        # Tactical: 11→64→32
+        # Tactical: 23→64→32
         self.tactical_mlp = nn.Sequential(
-            make_fc_layer(11, ENC_H), nn.ReLU(),
+            make_fc_layer(23, ENC_H), nn.ReLU(),
             make_fc_layer(ENC_H, ATTN_D),
         )
 
@@ -180,27 +180,27 @@ class Model(nn.Module):
     # Entity splitting and encoding
     # ------------------------------------------------------------------
     def _encode_entities(self, feature_vec, B_flat):
-        """Split 159-dim feature into entity slices, return concat+keys.
+        """Split 177-dim feature into entity slices, return concat+keys.
 
-        Feature layout [B_flat, 159]:
-          [0:39]   = Self hero
-          [39:78]  = Enemy hero
-          [78:85]  = Organ (enemy tower)
-          [85:96]  = Tactical
-          [96:124] = Friendly soldiers (4×7)
-          [124:152]= Enemy soldiers (4×7)
-          [152:159]= Resource
+        Feature layout [B_flat, 177]:
+          [0:42]   = Self hero
+          [42:84]  = Enemy hero
+          [84:91]  = Organ (enemy tower)
+          [91:114] = Tactical
+          [114:142]= Friendly soldiers (4×7)
+          [142:170]= Enemy soldiers (4×7)
+          [170:177]= Resource
         """
         ATTN_D = 32
 
         # ---- Split ----
-        self_feat     = feature_vec[:, 0:39]
-        emy_feat      = feature_vec[:, 39:78]
-        tower_feat    = feature_vec[:, 78:85]
-        tactical_feat = feature_vec[:, 85:96]
-        fri_soldiers  = feature_vec[:, 96:124].reshape(B_flat, 4, 7)
-        emy_soldiers  = feature_vec[:, 124:152].reshape(B_flat, 4, 7)
-        resource_feat = feature_vec[:, 152:159]
+        self_feat     = feature_vec[:, 0:42]
+        emy_feat      = feature_vec[:, 42:84]
+        tower_feat    = feature_vec[:, 84:91]
+        tactical_feat = feature_vec[:, 91:114]
+        fri_soldiers  = feature_vec[:, 114:142].reshape(B_flat, 4, 7)
+        emy_soldiers  = feature_vec[:, 142:170].reshape(B_flat, 4, 7)
+        resource_feat = feature_vec[:, 170:177]
 
         # ---- Encode ----
         self_hero_f, self_hero_k = self.hero_encoder(self_feat)       # (B,64), (B,32)
